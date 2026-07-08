@@ -1,0 +1,23 @@
+[package]
+name = "misa-wbc"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Takara Kasai <takara.kasai@gmail.com>"]
+description = "Whole-body control for robots: a hierarchical QP (HoQP) core with an OpenSoT-style task / constraint / affine-variable vocabulary. Model-agnostic — consumers compute the rigid-body matrices (M, h, J, J̇v) with any dynamics engine (e.g. misarta) and hand them in. Depends only on nalgebra (+ optional Clarabel), so arm / legged / humanoid hosts can share one WBC without pulling in a mesh / RBD stack."
+
+[dependencies]
+nalgebra = "0.34.2"
+clarabel = { version = "0.11.1", features = ["default"], optional = true }
+
+[dev-dependencies]
+approx = "0.5"
+
+[features]
+# Clarabel is on by default: the HoQP inner problems are
+# equality + inequality QPs with a proximal term, which the
+# interior-point backend solves robustly. Build with
+# `--no-default-features` to get only the built-in dense active-set
+# solver (enough for the standalone `qp` module, not the HoQP).
+default = ["clarabel"]
+clarabel = ["dep:clarabel"]
