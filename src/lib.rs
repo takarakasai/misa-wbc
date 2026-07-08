@@ -33,24 +33,31 @@
 //!   with `+` at one priority level.
 //! - [`ho_qp`] — the [`HoQp`] hierarchical solver: each task is solved
 //!   in the null space of all higher-priority tasks' equalities.
-//! - [`dims`] — decision-vector bookkeeping (`x = [q̈; f; τ]`) for the
-//!   common legged layout. The general variable-layout / affine
-//!   vocabulary (arbitrary named variables) lands next (Phase 1).
+//! - [`affine`] — the OpenSoT-style variable vocabulary:
+//!   [`VarLayout`] declares a named decision-vector layout (contact
+//!   count is runtime, not fixed) and [`Affine`] (`y = M·x + q`)
+//!   composes task residuals symbolically. [`Task::soft_eq`] /
+//!   [`Task::le`] / [`Task::ge`] / [`Task::in_range`] turn an affine
+//!   into a task.
+//! - [`dims`] — fixed-layout bookkeeping (`x = [q̈; f; τ]`) for the
+//!   common legged case; a thin alternative to `VarLayout`.
 //!
 //! ## Status
 //!
-//! Phase 0: the HoQP core is carried over verbatim from the
-//! (validated) quadruped-gait WBC and made model-agnostic. The
-//! OpenSoT-style affine-variable layer and the generic task / constraint
-//! catalogue (Cartesian acceleration, friction cone, torque limits,
-//! CBF joint limits, force distribution) follow. See the design study in
-//! the articara repo (`ref/opensot.md`).
+//! Phase 0: the HoQP core carried over from the (validated)
+//! quadruped-gait WBC and made model-agnostic. Phase 1: the
+//! OpenSoT-style affine-variable layer ([`affine`]). Next: the generic
+//! task / constraint catalogue (Cartesian acceleration, friction cone,
+//! torque limits, CBF joint limits, force distribution). See the design
+//! study in the articara repo (`ref/opensot.md`).
 
+pub mod affine;
 pub mod dims;
 pub mod ho_qp;
 pub mod qp;
 pub mod task;
 
+pub use affine::{Affine, Var, VarLayout, VarLayoutBuilder};
 pub use dims::WbcDims;
 pub use ho_qp::{HoQp, WarmStart};
 pub use qp::{solve_qp, QpConfig, QpSolution, QpSolver, QpStatus};

@@ -99,6 +99,55 @@ impl Task {
         }
         self
     }
+
+    // ─── Affine constructors ────────────────────────────────────────────
+    //
+    // Build a task from an [`Affine`] residual / expression. The residual
+    // convention matches OpenSoT: a task driving `e(x) = M·x + q → 0`
+    // becomes the soft equality `A = M, b = −q` (minimising ‖M·x + q‖²).
+
+    /// Soft equality that drives the affine residual `e = M·x + q` to
+    /// zero: `A = e.M`, `b = −e.q`. Place at priority 0 in a [`HoQp`]
+    /// chain for a hard-equality effect.
+    ///
+    /// [`HoQp`]: crate::HoQp
+    pub fn soft_eq(residual: &crate::affine::Affine) -> Task {
+        Task::equality(residual.m().clone(), -residual.q())
+    }
+
+    /// Hard inequality `expr ≤ ub`, i.e. `M·x + q ≤ ub` → `M·x ≤ ub − q`.
+    pub fn le(expr: &crate::affine::Affine, ub: &DVector<f64>) -> Task {
+        assert_eq!(
+            expr.out_size(),
+            ub.len(),
+            "Task::le: expr out_size ({}) must equal ub len ({})",
+            expr.out_size(),
+            ub.len(),
+        );
+        Task::inequality(expr.m().clone(), ub - expr.q())
+    }
+
+    /// Hard inequality `expr ≥ lb`, i.e. `−M·x ≤ q − lb`.
+    pub fn ge(expr: &crate::affine::Affine, lb: &DVector<f64>) -> Task {
+        assert_eq!(
+            expr.out_size(),
+            lb.len(),
+            "Task::ge: expr out_size ({}) must equal lb len ({})",
+            expr.out_size(),
+            lb.len(),
+        );
+        Task::inequality(-expr.m(), expr.q() - lb)
+    }
+
+    /// Hard double-sided inequality `lb ≤ expr ≤ ub` (the `le` and `ge`
+    /// rows concatenated).
+    pub fn in_range(
+        lb: &DVector<f64>,
+        expr: &crate::affine::Affine,
+        ub: &DVector<f64>,
+    ) -> Task {
+        Task::le(expr, ub) + Task::ge(expr, lb)
+    }
 }
 
 impl std::ops::Add for Task {
