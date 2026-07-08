@@ -38,6 +38,10 @@
 //!   selects the HQP strategy ([`HqpStrategy`]) and the QP backend
 //!   ([`QpSolver`]) so strategy / backend are a config switch, not a
 //!   rewrite.
+//! - [`tasks`] — a catalogue of ready-made WBC tasks (equation of
+//!   motion, Cartesian acceleration, friction pyramid, box limits,
+//!   tracking / regularisation) built over the affine layer from the
+//!   `M / h / J / J̇v` matrices a dynamics engine produces.
 //! - [`affine`] — the OpenSoT-style variable vocabulary:
 //!   [`VarLayout`] declares a named decision-vector layout (contact
 //!   count is runtime, not fixed) and [`Affine`] (`y = M·x + q`)
@@ -62,6 +66,7 @@ pub mod ho_qp;
 pub mod qp;
 pub mod solve;
 pub mod task;
+pub mod tasks;
 
 pub use affine::{Affine, Var, VarLayout, VarLayoutBuilder};
 pub use dims::WbcDims;
