@@ -1,8 +1,13 @@
 # misa-wbc
 
+[![CI](https://github.com/takarakasai/misa-wbc/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/takarakasai/misa-wbc/actions/workflows/ci.yml) [![coverage](https://codecov.io/gh/takarakasai/misa-wbc/graph/badge.svg)](https://codecov.io/gh/takarakasai/misa-wbc)
+
 Model-agnostic **whole-body control** for robots: a hierarchical QP
 (HoQP) core with an [OpenSoT](https://github.com/ADVRHumanoids/OpenSoT)-style
 vocabulary of tasks, constraints and affine optimization variables.
+Companion to the [`misarta`](https://github.com/takarakasai/misarta)
+rigid-body-dynamics library — misarta computes the matrices, misa-wbc
+solves the control QP.
 
 ## Boundary
 
