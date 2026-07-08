@@ -63,6 +63,21 @@ pub struct HoQp {
     /// it back as the next tick's warm-start anchor (see
     /// [`WarmStart`]). Length = `n_v + n_slack` for this level.
     y_solution: DVector<f64>,
+    /// Status of the inner QP solved at this level. `Optimal` on a
+    /// healthy tick; a non-optimal value means this level (and the
+    /// levels below it) degraded — surfaced by the `solve` wrapper.
+    status: QpStatus,
+}
+
+/// Default inner-QP config for the HoQP: the interior-point Clarabel
+/// backend, which handles the equality + inequality + prox structure
+/// of the per-level problems robustly. `new` / `new_with_higher` use
+/// this; `new_with_cfg` lets a caller pick the backend / tolerances.
+fn hoqp_default_qp_cfg() -> QpConfig {
+    QpConfig {
+        solver: QpSolver::Clarabel,
+        ..Default::default()
+    }
 }
 
 /// Warm-start hint for [`HoQp::new_with_higher_warm`].
@@ -104,23 +119,37 @@ impl<'a> WarmStart<'a> {
 }
 
 impl HoQp {
-    /// Solve a single-priority problem (no higher tasks).
+    /// Solve a single-priority problem (no higher tasks) with the
+    /// default (Clarabel) inner-QP backend.
     pub fn new(task: Task) -> Self {
-        Self::new_with_higher_warm(task, None, &WarmStart::COLD)
+        Self::new_with_cfg(task, None, &WarmStart::COLD, &hoqp_default_qp_cfg())
     }
 
-    /// Solve `task` at the priority level immediately below `higher`.
-    /// `higher` may be `None` (this is the top level).
+    /// Solve `task` at the priority level immediately below `higher`,
+    /// default backend. `higher` may be `None` (this is the top level).
     pub fn new_with_higher(task: Task, higher: Option<&HoQp>) -> Self {
-        Self::new_with_higher_warm(task, higher, &WarmStart::COLD)
+        Self::new_with_cfg(task, higher, &WarmStart::COLD, &hoqp_default_qp_cfg())
     }
 
-    /// Like [`HoQp::new_with_higher`] but with a warm-start hint for
-    /// the inner QP. See [`WarmStart`].
+    /// Like [`HoQp::new_with_higher`] but with a warm-start hint,
+    /// default backend. See [`WarmStart`].
     pub fn new_with_higher_warm(
         task: Task,
         higher: Option<&HoQp>,
         warm: &WarmStart<'_>,
+    ) -> Self {
+        Self::new_with_cfg(task, higher, warm, &hoqp_default_qp_cfg())
+    }
+
+    /// Full constructor: solve `task` below `higher`, with a warm-start
+    /// hint and an explicit inner-QP config (`solver` backend +
+    /// tolerances). The config's `prox_weight` is overridden by the
+    /// warm-start's per-level projection logic.
+    pub fn new_with_cfg(
+        task: Task,
+        higher: Option<&HoQp>,
+        warm: &WarmStart<'_>,
+        qp_cfg: &QpConfig,
     ) -> Self {
         let (n_decision_total, prev) = match higher {
             Some(h) => (h.state.x.len(), h.state.clone()),
@@ -262,14 +291,15 @@ impl HoQp {
             } else {
                 None
             };
+        // Inherit the caller's backend + tolerances; the prox weight is
+        // driven by the per-level warm-start projection, not the config.
         let cfg = QpConfig {
-            solver: QpSolver::Clarabel,
             prox_weight: if warm_y_owned.is_some() {
                 warm.prox_weight
             } else {
                 0.0
             },
-            ..Default::default()
+            ..qp_cfg.clone()
         };
         let qp_a_iq = (m_total > 0).then(|| d_total.clone());
         let qp_b_iq = (m_total > 0).then(|| f_total.clone());
@@ -342,12 +372,18 @@ impl HoQp {
                 stacked_slack,
             },
             y_solution: y_full,
+            status: sol.status,
         }
     }
 
     /// Final solution `x` after all levels.
     pub fn solution(&self) -> &DVector<f64> {
         &self.state.x
+    }
+
+    /// Status of this level's inner QP (`Optimal` on a healthy tick).
+    pub fn status(&self) -> QpStatus {
+        self.status
     }
 
     /// Null-space basis after all levels (for diagnostic / chaining).
@@ -451,7 +487,7 @@ fn stack_vec(v1: &DVector<f64>, v2: &DVector<f64>) -> DVector<f64> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "clarabel"))]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;

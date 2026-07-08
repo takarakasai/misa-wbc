@@ -6,7 +6,7 @@
 //! `VarLayout` variables is a zero-overhead reformulation of the raw
 //! matrix assembly the quadruped WBC uses today.
 
-use misa_wbc::{HoQp, Task, VarLayout};
+use misa_wbc::{solve, SolveConfig, Task, VarLayout};
 use nalgebra::{DMatrix, DVector};
 
 /// Toy layout: x = [ qddot(2) ; f(2) ]  (n = 4).
@@ -77,27 +77,12 @@ fn affine_and_hand_assembly_are_identical() {
     }
 }
 
-/// Run a priority-ordered task list through the HoQp chain and return
-/// the global solution. (A convenience `solve()` wrapper with typed
-/// errors lands in a later phase; this is the raw chain the quadruped
-/// WBC uses.)
-fn solve_chain(levels: &[Task]) -> DVector<f64> {
-    let mut prev: Option<HoQp> = None;
-    for t in levels {
-        let hqp = match &prev {
-            None => HoQp::new(t.clone()),
-            Some(p) => HoQp::new_with_higher(t.clone(), Some(p)),
-        };
-        prev = Some(hqp);
-    }
-    prev.expect("at least one level").solution().clone()
-}
-
 #[cfg(feature = "clarabel")]
 #[test]
 fn affine_and_hand_assembly_solve_identically() {
-    let x_hand = solve_chain(&assemble_by_hand());
-    let x_aff = solve_chain(&assemble_with_affine());
+    let cfg = SolveConfig::default();
+    let x_hand = solve(&assemble_by_hand(), &cfg).unwrap().x;
+    let x_aff = solve(&assemble_with_affine(), &cfg).unwrap().x;
     assert!(
         (&x_hand - &x_aff).norm() < 1e-9,
         "solutions differ: {:?} vs {:?}",
