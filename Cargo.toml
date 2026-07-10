@@ -11,6 +11,10 @@ nalgebra = "0.34.2"
 clarabel = { version = "0.11.1", features = ["default"], optional = true }
 
 [dev-dependencies]
+# Real-robot models for the benchmark examples only — the library
+# itself stays nalgebra-only (dev-dependencies do not propagate).
+misarta = { git = "https://github.com/takarakasai/misarta.git" }
+misarta-formats = { git = "https://github.com/takarakasai/misarta.git" }
 approx = "0.5"
 
 [features]
