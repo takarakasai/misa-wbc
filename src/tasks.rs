@@ -20,6 +20,7 @@
 //! | [`track`] | acceleration::Postural, swing-leg, force/τ regularisation |
 //! | [`friction_pyramid`] | constraints::force::FrictionCone |
 //! | [`patch_contact`] | GID SetContactSupport / OpenSoT CoP+WrenchLimits |
+//! | [`centroidal_momentum`] | GID Momentum unit / OpenSoT CoM+AngularMomentum |
 //! | [`box_bound`] | TorqueLimits / WrenchLimits (symmetric) |
 //!
 //! Decision-vector layout is the caller's: these builders only touch the
@@ -181,6 +182,38 @@ pub fn friction_pyramid(force: &impl AsAffine, mu: f64) -> Task {
     ]);
     let expr = &c * &force.as_affine();
     Task::le(&expr, &DVector::zeros(5))
+}
+
+/// Centroidal momentum-rate tracking:
+/// `A_G·q̈ + Ȧ_G·v ≈ h_rate_ref` — drive the whole-body (centroidal)
+/// momentum rate `ḣ = [ḣ_ang; ḣ_lin]` to a reference. THE balance
+/// primitive: GID's Momentum operation unit, OpenSoT's CoM/angular-
+/// momentum tasks.
+///
+/// - `qddot`: the joint-acceleration expression (any formulation).
+/// - `cmm`: the Centroidal Momentum Matrix `A_G`, `6 × nv`
+///   (misarta: `compute_centroidal_momentum_matrix`).
+/// - `dcmm_v`: the bias `Ȧ_G·v`, length 6
+///   (misarta: `compute_cmm_dot_times_v`).
+/// - `h_rate_ref`: desired momentum rate, length 6 (`[ang; lin]`, the
+///   ecosystem row convention). E.g. for CoM stabilisation feed the
+///   linear rows `m·(ẍ_com)_ref` from [`crate::refgen`] and zero (or a
+///   damping law) on the angular rows.
+///
+/// Row-selection (linear-only / angular-only) is the caller slicing
+/// `cmm` / `dcmm_v` / the reference before the call.
+pub fn centroidal_momentum(
+    qddot: &impl AsAffine,
+    cmm: &DMatrix<f64>,
+    dcmm_v: &DVector<f64>,
+    h_rate_ref: &DVector<f64>,
+) -> Task {
+    assert_eq!(cmm.ncols(), qddot.out_size(), "momentum: CMM cols must equal qddot size");
+    assert_eq!(cmm.nrows(), dcmm_v.len(), "momentum: CMM rows must equal dcmm_v len");
+    assert_eq!(cmm.nrows(), h_rate_ref.len(), "momentum: CMM rows must equal ref len");
+    // Same shape as cartesian_acceleration with J = A_G — named so the
+    // balance intent reads at call sites.
+    cartesian_acceleration(qddot, cmm, dcmm_v, h_rate_ref)
 }
 
 /// Parameters of a rectangular **surface (patch) contact** — the full
@@ -349,6 +382,21 @@ mod tests {
         assert!((&t.f - &t.d * &cop).min() < 0.0, "CoP must bind (10 > 0.05·100)");
         let twist = DVector::from_vec(vec![0.0, 0.0, 5.0, 0.0, 0.0, 100.0]);
         assert!((&t.f - &t.d * &twist).min() < 0.0, "torsion must bind (5 > 0.02·100)");
+    }
+
+    #[test]
+    fn centroidal_momentum_is_cartesian_with_cmm() {
+        let l = layout(4, 0, 0);
+        let q = l.var("qddot");
+        let cmm = DMatrix::from_fn(6, 4, |i, j| ((i + j) as f64 * 0.31).sin());
+        let dcmm_v = DVector::from_fn(6, |i, _| i as f64 * 0.1);
+        let href = DVector::from_fn(6, |i, _| 1.0 - i as f64 * 0.2);
+        let t = centroidal_momentum(&q, &cmm, &dcmm_v, &href);
+        assert_eq!(t.n_eq(), 6);
+        // Residual definition: A_G·q̈ = href − dcmm_v.
+        let x = DVector::from_vec(vec![0.3, -0.4, 0.5, 0.9]);
+        let want = &cmm * &x - (&href - &dcmm_v);
+        assert!(((&t.a * &x - &t.b) - want).norm() < 1e-12);
     }
 
     /// EoM residual matches the hand-assembled `M·q̈ − Jcᵀ·f − Sᵀ·τ + h`
