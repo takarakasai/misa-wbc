@@ -1,6 +1,6 @@
 //! The convenience entry point: hand a priority-ordered list of tasks
 //! to [`solve`] and get back the decision vector, without wiring the
-//! [`HoQp`](crate::HoQp) chain by hand.
+//! [`HoQp`] chain by hand.
 //!
 //! Two things are switchable through [`SolveConfig`]:
 //!
@@ -30,6 +30,15 @@ pub enum HqpStrategy {
     /// space of all higher-priority equalities, with slack variables
     /// relaxing higher inequalities. Strict lexicographic priority.
     NullSpace,
+    /// GID-style greedy force-budget cascade: each level solves a small
+    /// weighted least-squares QP for an *increment* on the committed
+    /// solution, then commits it. Inequalities accumulate downward (a
+    /// level's constraints bind every later level), so torque boxes at
+    /// level 0 become the shrinking budget of lower levels. Priority is
+    /// greedy, **not** lexicographic: a lower level may degrade an upper
+    /// task if the constraints leave it room (this is GID's documented
+    /// behaviour, useful for equivalence studies against it).
+    ForceBudgetCascade,
     // Future: WeightedQp (single QP, priorities as weights — fast,
     // approximate), EHqp (equality-only pseudo-inverse), ...
 }
@@ -168,6 +177,7 @@ pub fn solve_warm(
 
     match cfg.strategy {
         HqpStrategy::NullSpace => Ok(solve_null_space(levels, cfg, warm_anchor)),
+        HqpStrategy::ForceBudgetCascade => Ok(solve_force_budget(levels, cfg, n)),
     }
 }
 
@@ -200,12 +210,106 @@ fn solve_null_space(
     Solution { warm_anchor: x.clone(), x, status }
 }
 
+/// The GID-style force-budget cascade (see [`HqpStrategy::ForceBudgetCascade`]).
+///
+/// Per level `k`, with committed solution `x_c` and the inequality rows
+/// accumulated from levels `0..=k`:
+///
+/// ```text
+///   min_δ  ‖A_k(x_c + δ) − b_k‖² + ρ·‖δ‖²
+///   s.t.   D_{0..k}·(x_c + δ) ≤ f_{0..k}
+/// ```
+///
+/// then `x_c ← x_c + δ`. The regularisation `ρ` is
+/// [`SolveConfig::prox_weight`] with a `1e-8` floor (GID's tiny
+/// minimum-effort term; it also makes each level's optimum unique). The
+/// warm anchor is unused — the cascade always increments from `x_c`,
+/// mirroring GID's committed `JointForce`. On a level failure the
+/// increment is skipped (GID's use-last-force fallback) and the first
+/// failure is reported as [`SolveStatus::Degraded`].
+fn solve_force_budget(levels: &[Task], cfg: &SolveConfig, n: usize) -> Solution {
+    use nalgebra::DMatrix;
+
+    let qp_cfg = cfg.qp_cfg();
+    let rho = cfg.prox_weight.max(1e-8);
+
+    let mut x_c = DVector::<f64>::zeros(n);
+    let mut stacked_d: Option<DMatrix<f64>> = None;
+    let mut stacked_f: Option<DVector<f64>> = None;
+    let mut degraded: Option<(usize, QpStatus)> = None;
+
+    for (k, t) in levels.iter().enumerate() {
+        // Accumulate this level's inequalities (they bind from here on).
+        if t.n_iq() > 0 {
+            stacked_d = Some(match stacked_d.take() {
+                None => t.d.clone(),
+                Some(d) => stack_rows(&d, &t.d),
+            });
+            stacked_f = Some(match stacked_f.take() {
+                None => t.f.clone(),
+                Some(f) => stack_vec(&f, &t.f),
+            });
+        }
+
+        // H = A_kᵀA_k + ρI ;  g = A_kᵀ(A_k x_c − b_k)  (+ 0 from the ρ‖δ‖² center).
+        let mut h = DMatrix::<f64>::identity(n, n) * rho;
+        let mut g = DVector::<f64>::zeros(n);
+        if t.n_eq() > 0 {
+            h += t.a.transpose() * &t.a;
+            g += t.a.transpose() * (&t.a * &x_c - &t.b);
+        }
+
+        // Shifted inequalities:  D·δ ≤ f − D·x_c.
+        let shifted_f = stacked_f
+            .as_ref()
+            .map(|f| f - stacked_d.as_ref().expect("d/f stacked together") * &x_c);
+
+        let sol = crate::qp::solve_qp(
+            &h,
+            &g,
+            None,
+            None,
+            stacked_d.as_ref(),
+            shifted_f.as_ref(),
+            None,
+            &qp_cfg,
+        );
+        if sol.status == QpStatus::Optimal {
+            x_c += &sol.x;
+        } else if degraded.is_none() {
+            // Skip the increment (use-last-force) and report.
+            degraded = Some((k, sol.status));
+        }
+    }
+
+    let status = match degraded {
+        None => SolveStatus::Optimal,
+        Some((level, status)) => SolveStatus::Degraded { level, status },
+    };
+    Solution { warm_anchor: x_c.clone(), x: x_c, status }
+}
+
+fn stack_rows(top: &nalgebra::DMatrix<f64>, bottom: &nalgebra::DMatrix<f64>) -> nalgebra::DMatrix<f64> {
+    let mut out = nalgebra::DMatrix::zeros(top.nrows() + bottom.nrows(), top.ncols());
+    out.rows_mut(0, top.nrows()).copy_from(top);
+    out.rows_mut(top.nrows(), bottom.nrows()).copy_from(bottom);
+    out
+}
+
+fn stack_vec(top: &DVector<f64>, bottom: &DVector<f64>) -> DVector<f64> {
+    let mut out = DVector::zeros(top.len() + bottom.len());
+    out.rows_mut(0, top.len()).copy_from(top);
+    out.rows_mut(top.len(), bottom.len()).copy_from(bottom);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nalgebra::DMatrix;
 
     /// x = [a(1); b(1)];  prio0: a = 1 (eq) + b ≤ 3 (ineq);  prio1: b = 2.
+    #[cfg(feature = "clarabel")]
     fn levels() -> Vec<Task> {
         let p0 = Task::equality(
             DMatrix::from_row_slice(1, 2, &[1.0, 0.0]),

@@ -6,6 +6,10 @@
 //! `VarLayout` variables is a zero-overhead reformulation of the raw
 //! matrix assembly the quadruped WBC uses today.
 
+
+// Under --no-default-features only the non-Clarabel tests remain;
+// the shared fixtures/imports above them would trip -D warnings.
+#![cfg_attr(not(feature = "clarabel"), allow(unused))]
 use misa_wbc::{solve, SolveConfig, Task, VarLayout};
 use nalgebra::{DMatrix, DVector};
 

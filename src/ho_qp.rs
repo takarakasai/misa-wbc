@@ -393,7 +393,7 @@ impl HoQp {
 
     /// Inner-QP decision vector `y = [v; w]` solved at this level.
     /// Caller passes this back to the **same** level on the next tick
-    /// (via [`WarmStart::y_prev`]) to anchor the optimum and dampen
+    /// (via [`WarmStart::x_prev`]) to anchor the optimum and dampen
     /// jitter.
     pub fn y_solution(&self) -> &DVector<f64> {
         &self.y_solution

@@ -33,7 +33,7 @@
 //!   with `+` at one priority level.
 //! - [`ho_qp`] — the [`HoQp`] hierarchical solver: each task is solved
 //!   in the null space of all higher-priority tasks' equalities.
-//! - [`solve`] — the convenience entry point ([`solve`] / [`solve_warm`]):
+//! - [`mod@solve`] — the convenience entry point ([`solve()`] / [`solve_warm`]):
 //!   hand it a priority-ordered task list and a [`SolveConfig`], which
 //!   selects the HQP strategy ([`HqpStrategy`]) and the QP backend
 //!   ([`QpSolver`]) so strategy / backend are a config switch, not a
@@ -62,14 +62,16 @@
 
 pub mod affine;
 pub mod dims;
+pub mod dynamics;
 pub mod ho_qp;
 pub mod qp;
 pub mod solve;
 pub mod task;
 pub mod tasks;
 
-pub use affine::{Affine, Var, VarLayout, VarLayoutBuilder};
+pub use affine::{Affine, AsAffine, Var, VarLayout, VarLayoutBuilder};
 pub use dims::WbcDims;
+pub use dynamics::{Dynamics, Extracted, Formulation};
 pub use ho_qp::{HoQp, WarmStart};
 pub use qp::{solve_qp, QpConfig, QpSolution, QpSolver, QpStatus};
 pub use solve::{

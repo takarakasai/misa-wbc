@@ -3,7 +3,7 @@
 //! `J̇·v`) over an [`Affine`](crate::Affine) variable layout.
 //!
 //! Every function here is a pure builder: hand it the relevant
-//! [`Var`](crate::Var)s and matrices for the current tick and it returns
+//! [`Var`]s and matrices for the current tick and it returns
 //! a [`Task`]. Nothing is stateful and nothing knows about a specific
 //! robot — a quadruped host chooses which contacts are stance and slots
 //! the right rows in; an arm host uses the same `track` /
@@ -28,7 +28,7 @@
 
 use nalgebra::{DMatrix, DVector};
 
-use crate::affine::{Affine, Var};
+use crate::affine::{AsAffine, Var};
 use crate::task::Task;
 
 /// Soft-equality tracking: drive an affine expression to a reference,
@@ -36,30 +36,30 @@ use crate::task::Task;
 /// postural / swing-leg / Cartesian / regularisation tasks.
 ///
 /// `reference` length must equal `expr.out_size()`.
-pub fn track(expr: &Affine, reference: &DVector<f64>) -> Task {
-    Task::soft_eq(&(expr - reference))
+pub fn track(expr: &impl AsAffine, reference: &DVector<f64>) -> Task {
+    Task::soft_eq(&(&expr.as_affine() - reference))
 }
 
 /// Regularise a variable toward a target value (`var ≈ target`) — a
 /// thin, well-named wrapper over [`track`] for force / torque / posture
 /// regularisation. `target` length must equal `var.size()`.
-pub fn regularize(var: &Var, target: &DVector<f64>) -> Task {
-    track(&var.affine(), target)
+pub fn regularize(var: &impl AsAffine, target: &DVector<f64>) -> Task {
+    track(var, target)
 }
 
 /// Symmetric box bound `−max ≤ var ≤ max` as a hard inequality. Covers
 /// actuator torque limits and (symmetric) wrench limits. All entries of
 /// `max` should be ≥ 0; `max` length must equal `var.size()`.
-pub fn box_bound(var: &Var, max: &DVector<f64>) -> Task {
+pub fn box_bound(var: &impl AsAffine, max: &DVector<f64>) -> Task {
     assert_eq!(
-        var.size(),
+        var.out_size(),
         max.len(),
-        "box_bound: var size ({}) must equal max len ({})",
-        var.size(),
+        "box_bound: expression size ({}) must equal max len ({})",
+        var.out_size(),
         max.len(),
     );
     let neg = -max;
-    Task::in_range(&neg, &var.affine(), max)
+    Task::in_range(&neg, &var.as_affine(), max)
 }
 
 /// Cartesian (task-space) acceleration tracking:
@@ -74,16 +74,16 @@ pub fn box_bound(var: &Var, max: &DVector<f64>) -> Task {
 /// - `dj_v`: the bias `J̇·v`, length `m`.
 /// - `accel_ref`: desired task acceleration, length `m`.
 pub fn cartesian_acceleration(
-    qddot: &Var,
+    qddot: &impl AsAffine,
     j: &DMatrix<f64>,
     dj_v: &DVector<f64>,
     accel_ref: &DVector<f64>,
 ) -> Task {
-    assert_eq!(j.ncols(), qddot.size(), "cartesian: J cols must equal qddot size");
+    assert_eq!(j.ncols(), qddot.out_size(), "cartesian: J cols must equal qddot size");
     assert_eq!(j.nrows(), dj_v.len(), "cartesian: J rows must equal dj_v len");
     assert_eq!(j.nrows(), accel_ref.len(), "cartesian: J rows must equal accel_ref len");
     // expr = J·q̈ + J̇·v ;  track toward accel_ref.
-    let expr = &(j * qddot) + dj_v;
+    let expr = &(j * &qddot.as_affine()) + dj_v;
     track(&expr, accel_ref)
 }
 
@@ -92,7 +92,7 @@ pub fn cartesian_acceleration(
 /// reference special case of [`cartesian_acceleration`], emitted as a
 /// (soft) equality — place it at priority 0 for a hard contact.
 pub fn zero_contact_acceleration(
-    qddot: &Var,
+    qddot: &impl AsAffine,
     j: &DMatrix<f64>,
     dj_v: &DVector<f64>,
 ) -> Task {
@@ -168,8 +168,8 @@ pub fn equation_of_motion(
 /// for the contact. For a rotated contact normal, pre-multiply the
 /// caller's force by the world→contact rotation, or use a rotated `C`
 /// (a `world_to_contact` overload lands with the model integration).
-pub fn friction_pyramid(force: &Var, mu: f64) -> Task {
-    assert_eq!(force.size(), 3, "friction_pyramid: force var must be 3-D");
+pub fn friction_pyramid(force: &impl AsAffine, mu: f64) -> Task {
+    assert_eq!(force.out_size(), 3, "friction_pyramid: force expression must be 3-D");
     #[rustfmt::skip]
     let c = DMatrix::from_row_slice(5, 3, &[
         0.0,  0.0, -1.0,
@@ -178,7 +178,7 @@ pub fn friction_pyramid(force: &Var, mu: f64) -> Task {
         0.0,  1.0, -mu,
         0.0, -1.0, -mu,
     ]);
-    let expr = &c * force;
+    let expr = &c * &force.as_affine();
     Task::le(&expr, &DVector::zeros(5))
 }
 

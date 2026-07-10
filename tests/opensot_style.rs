@@ -13,6 +13,10 @@
 //! with those tasks when they land (Phase 3+), since they need a robot
 //! model to produce Jacobians.
 
+
+// Under --no-default-features only the non-Clarabel tests remain;
+// the shared fixtures/imports above them would trip -D warnings.
+#![cfg_attr(not(feature = "clarabel"), allow(unused))]
 use misa_wbc::{solve, HqpStrategy, SolveConfig, SolveStatus, Task, VarLayout, WbcError};
 use nalgebra::{DMatrix, DVector};
 

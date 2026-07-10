@@ -23,8 +23,8 @@ mesh / RBD stack.
 
 ## Status
 
-**Phase 0** — the HoQP core is carried over from the (walking-validated)
-quadruped-gait WBC and made model-agnostic:
+The HoQP core is carried over from the (walking-validated)
+quadruped-gait WBC and made model-agnostic, then extended:
 
 - `qp` — internal dense QP solver (active-set + optional Clarabel,
   proximal warm-start), self-contained on nalgebra.
@@ -32,13 +32,24 @@ quadruped-gait WBC and made model-agnostic:
   hard inequality), combined with `+` at one priority level.
 - `ho_qp` — the `HoQp` hierarchical solver (each task solved in the null
   space of higher-priority equalities).
-- `dims` — decision-vector bookkeeping for `x = [q̈; f; τ]`.
+- `affine` — OpenSoT-style named variables (`VarLayout`) and affine
+  expressions (`Affine`), so variable structure is runtime, not fixed.
+- `tasks` — the generic catalogue: equation of motion, Cartesian
+  acceleration, contact no-motion, friction pyramid, box limits,
+  tracking / regularisation.
+- `solve` — the entry point with switchable HQP strategy
+  (`NullSpace` — strict lexicographic; `ForceBudgetCascade` — the
+  GID-style greedy force-budget hierarchy) and QP backend.
+- `dynamics` — **formulation switch**: the same task declarations run
+  as `x = [q̈; f; τ]` (explicit), `x = [q̈; f]` (τ eliminated,
+  OpenSoT-style) or `x = [τ; f]` (q̈ eliminated through `M⁻¹`,
+  GID-style force space), for equal-footing comparisons across the
+  three whole-body-control formulations.
 
-**Next** — the OpenSoT-style affine-variable layer (arbitrary named
-variables, so contact count and variable structure are runtime, not
-fixed) and the generic task / constraint catalogue (Cartesian
-acceleration, friction cone, torque limits, CBF joint limits, force
-distribution). Quadruped-specific weights stay in quadruped-gait.
+**Next** — the ergonomic stack layer (named levels, per-task
+achievement report), patch contacts (CoP box + torsional friction),
+reference generators (PD / impedance), centroidal momentum task.
+Quadruped-specific weights stay in quadruped-gait.
 
 ## Features
 

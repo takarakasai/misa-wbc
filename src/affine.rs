@@ -143,6 +143,37 @@ impl Var {
     }
 }
 
+/// Anything that can stand in for an affine expression of the decision
+/// vector — a raw [`Var`] block or a composed [`Affine`]. Task builders
+/// accept `&impl AsAffine` so the same call works with a plain variable
+/// (`x = [q̈; f; τ]`, the explicit formulation) or an eliminated
+/// quantity (`q̈` as `M⁻¹(Sᵀτ + Jcᵀf − h)` in the force-space
+/// formulation) without a separate `_expr` API.
+pub trait AsAffine {
+    /// The expression as a concrete [`Affine`] map.
+    fn as_affine(&self) -> Affine;
+    /// Output dimension of the expression.
+    fn out_size(&self) -> usize;
+}
+
+impl AsAffine for Var {
+    fn as_affine(&self) -> Affine {
+        self.affine()
+    }
+    fn out_size(&self) -> usize {
+        self.size
+    }
+}
+
+impl AsAffine for Affine {
+    fn as_affine(&self) -> Affine {
+        self.clone()
+    }
+    fn out_size(&self) -> usize {
+        Affine::out_size(self)
+    }
+}
+
 // ─── Affine ─────────────────────────────────────────────────────────────────
 
 /// An affine map `y = M·x + q` from the global decision vector `x` to a
