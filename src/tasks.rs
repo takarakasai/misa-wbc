@@ -19,6 +19,7 @@
 //! | [`cartesian_acceleration`] | acceleration::Cartesian / CoM / Contact |
 //! | [`track`] | acceleration::Postural, swing-leg, force/τ regularisation |
 //! | [`friction_pyramid`] | constraints::force::FrictionCone |
+//! | [`patch_contact`] | GID SetContactSupport / OpenSoT CoP+WrenchLimits |
 //! | [`box_bound`] | TorqueLimits / WrenchLimits (symmetric) |
 //!
 //! Decision-vector layout is the caller's: these builders only touch the
@@ -182,6 +183,72 @@ pub fn friction_pyramid(force: &impl AsAffine, mu: f64) -> Task {
     Task::le(&expr, &DVector::zeros(5))
 }
 
+/// Parameters of a rectangular **surface (patch) contact** — the full
+/// GID `SetContactSupport` set: Coulomb friction, centre-of-pressure
+/// (CoP/ZMP) box, torsional friction and unilaterality, all coupled to
+/// the normal force.
+#[derive(Clone, Copy, Debug)]
+pub struct ContactPatch {
+    /// Coulomb friction coefficient μ (tangential ≤ μ·fz).
+    pub mu: f64,
+    /// Half-lengths (`Lx`, `Ly`) of the support rectangle: the CoP must
+    /// satisfy `|my| ≤ Lx·fz`, `|mx| ≤ Ly·fz`.
+    pub cop_half: (f64, f64),
+    /// Torsional friction coefficient (`|mz| ≤ μ_t·fz`).
+    pub mu_torsion: f64,
+    /// Upper bound on the normal force (`fz ≤ f_max`).
+    pub f_max: f64,
+}
+
+/// The 12 linear inequality rows of a rectangular patch contact,
+/// `C·w ≤ f`, over a 6-D contact **wrench** expression `w = [m; f]`
+/// (moment rows 0–2, force rows 3–5 — the dual of this ecosystem's
+/// `[angular; linear]` twist row convention, so `Jᵀ·w` works directly
+/// with a misarta 6-D contact Jacobian). Assumes the surface normal is
+/// the contact frame's +z:
+///
+/// ```text
+///   −fz ≤ 0,             fz ≤ f_max          (unilateral + cap)
+///   ±fx − μ·fz    ≤ 0,   ±fy − μ·fz    ≤ 0   (friction pyramid)
+///   ±mx − Ly·fz   ≤ 0,   ±my − Lx·fz   ≤ 0   (CoP inside the patch)
+///   ±mz − μt·fz   ≤ 0                        (torsional friction)
+/// ```
+///
+/// This is GID's `Set*ContactSupport` constraint set (its `Multiplier`
+/// coupling rows) as one task. For a 3-D point contact use
+/// [`friction_pyramid`] instead.
+pub fn patch_contact(wrench: &impl AsAffine, patch: &ContactPatch) -> Task {
+    assert_eq!(wrench.out_size(), 6, "patch_contact: wrench must be 6-D [m; f]");
+    let (mx, my, mz, fx, fy, fz) = (0, 1, 2, 3, 4, 5);
+    let (lx, ly) = patch.cop_half;
+    let mut c = DMatrix::zeros(12, 6);
+    let mut f = DVector::zeros(12);
+    // unilateral + cap
+    c[(0, fz)] = -1.0;
+    c[(1, fz)] = 1.0;
+    f[1] = patch.f_max;
+    // friction pyramid
+    for (row, axis, sign) in [(2, fx, 1.0), (3, fx, -1.0), (4, fy, 1.0), (5, fy, -1.0)] {
+        c[(row, axis)] = sign;
+        c[(row, fz)] = -patch.mu;
+    }
+    // CoP box:  |mx| ≤ Ly·fz,  |my| ≤ Lx·fz
+    for (row, axis, sign, half) in
+        [(6, mx, 1.0, ly), (7, mx, -1.0, ly), (8, my, 1.0, lx), (9, my, -1.0, lx)]
+    {
+        c[(row, axis)] = sign;
+        c[(row, fz)] = -half;
+    }
+    // torsional friction
+    c[(10, mz)] = 1.0;
+    c[(10, fz)] = -patch.mu_torsion;
+    c[(11, mz)] = -1.0;
+    c[(11, fz)] = -patch.mu_torsion;
+
+    let expr = &c * &wrench.as_affine();
+    Task::le(&expr, &f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +322,33 @@ mod tests {
         // A pulling force (fz < 0) violates the unilateral row.
         let pull = DVector::from_vec(vec![0.0, 0.0, -1.0]);
         assert!((&t.d * &pull)[0] > 0.0, "pull should violate unilateral row");
+    }
+
+    #[test]
+    fn patch_contact_rows() {
+        let l = VarLayout::builder().add("w", 6).build();
+        let w = l.var("w");
+        let patch = ContactPatch { mu: 0.5, cop_half: (0.10, 0.05), mu_torsion: 0.02, f_max: 200.0 };
+        let t = patch_contact(&w, &patch);
+        assert_eq!(t.n_iq(), 12);
+
+        // A wrench well inside every cone: fz = 100, small everything else.
+        //   w = [mx, my, mz, fx, fy, fz]
+        let ok = DVector::from_vec(vec![1.0, 2.0, 0.5, 10.0, -10.0, 100.0]);
+        let m = &t.f - &t.d * &ok;
+        assert!(m.min() > 0.0, "inside wrench should have positive margin: {}", m.min());
+
+        // Violations, one row family at a time.
+        let pull = DVector::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.0, -1.0]);
+        assert!((&t.f - &t.d * &pull).min() < 0.0, "pulling must violate");
+        let cap = DVector::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.0, 300.0]);
+        assert!((&t.f - &t.d * &cap).min() < 0.0, "f_max must bind");
+        let slip = DVector::from_vec(vec![0.0, 0.0, 0.0, 80.0, 0.0, 100.0]);
+        assert!((&t.f - &t.d * &slip).min() < 0.0, "friction must bind (80 > 0.5·100)");
+        let cop = DVector::from_vec(vec![10.0, 0.0, 0.0, 0.0, 0.0, 100.0]);
+        assert!((&t.f - &t.d * &cop).min() < 0.0, "CoP must bind (10 > 0.05·100)");
+        let twist = DVector::from_vec(vec![0.0, 0.0, 5.0, 0.0, 0.0, 100.0]);
+        assert!((&t.f - &t.d * &twist).min() < 0.0, "torsion must bind (5 > 0.02·100)");
     }
 
     /// EoM residual matches the hand-assembled `M·q̈ − Jcᵀ·f − Sᵀ·τ + h`
