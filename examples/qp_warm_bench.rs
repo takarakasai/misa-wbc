@@ -191,7 +191,9 @@ fn main() {
 
     let mut runs: Vec<Run> = Vec::new();
 
-    for mode in ["ActiveSet cold", "ActiveSet warm", "Clarabel"] {
+    let ipm_cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+
+    for mode in ["ActiveSet cold", "ActiveSet warm", "Ipm", "Clarabel"] {
         let mut ws = QpWorkspace::new();
         let mut times = Vec::with_capacity(TICKS);
         let mut iters = 0usize;
@@ -209,6 +211,7 @@ fn main() {
                 "ActiveSet warm" => {
                     solve_qp_warm(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &as_cfg, &mut ws)
                 }
+                "Ipm" => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &ipm_cfg),
                 _ => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &cl_cfg),
             };
             times.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -220,11 +223,7 @@ fn main() {
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         runs.push(Run {
-            name: match mode {
-                "ActiveSet cold" => "ActiveSet cold",
-                "ActiveSet warm" => "ActiveSet warm",
-                _ => "Clarabel",
-            },
+            name: mode,
             med_ms: times[TICKS / 2],
             worst_ms: times[TICKS - 1],
             iters,
