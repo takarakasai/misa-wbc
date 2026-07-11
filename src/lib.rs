@@ -76,7 +76,7 @@ pub use dims::WbcDims;
 pub use dynamics::{Dynamics, Extracted, Formulation};
 pub use stack::{Stack, StackSolution};
 pub use ho_qp::{HoQp, WarmStart};
-pub use qp::{solve_qp, QpConfig, QpSolution, QpSolver, QpStatus};
+pub use qp::{solve_qp, solve_qp_warm, QpConfig, QpSolution, QpSolver, QpStatus, QpWorkspace};
 pub use solve::{
     solve, solve_warm, HqpStrategy, Solution, SolveConfig, SolveStatus, WbcError,
 };

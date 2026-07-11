@@ -37,7 +37,7 @@
 //! assert!((sol.x[1] - 1.0).abs() < 1e-6);
 //! ```
 
-use nalgebra::{DMatrix, DVector};
+use nalgebra::{Cholesky, DMatrix, DVector, Dyn};
 
 // ─── Solver backend selection ───────────────────────────────────────────────
 
@@ -133,6 +133,36 @@ impl Default for QpConfig {
     }
 }
 
+// ─── Warm-start workspace ───────────────────────────────────────────────────
+
+/// Reusable warm-start state for the [`QpSolver::ActiveSet`] backend —
+/// qpOASES's "online active set" idea, pragmatically: keep the previous
+/// solution and working set, and let the next (identical or gently
+/// perturbed) solve start from them instead of a cold Phase-1. For a
+/// repeated QP the re-solve converges in O(1) iterations; for a
+/// perturbed one the previous point is re-projected onto the new
+/// equality manifold and the working set re-seeded.
+///
+/// Feed it to [`solve_qp_warm`]; every solve updates it in place.
+/// Ignored by the Clarabel backend (which is warm-start-free here).
+#[derive(Clone, Debug, Default)]
+pub struct QpWorkspace {
+    x: Option<DVector<f64>>,
+    working_set: Vec<usize>,
+}
+
+impl QpWorkspace {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop the stored state — the next solve starts cold.
+    pub fn clear(&mut self) {
+        self.x = None;
+        self.working_set.clear();
+    }
+}
+
 // ─── Solver (dispatch) ──────────────────────────────────────────────────────
 
 /// Solve a dense QP, dispatching to the backend specified in `config.solver`.
@@ -156,6 +186,41 @@ pub fn solve_qp(
     b_iq: Option<&DVector<f64>>,
     x0: Option<&DVector<f64>>,
     config: &QpConfig,
+) -> QpSolution {
+    solve_qp_impl(h, c, a_eq, b_eq, a_iq, b_iq, x0, config, None)
+}
+
+/// [`solve_qp`] with a persistent [`QpWorkspace`]: the active-set
+/// backend starts from the workspace's previous solution / working set
+/// and stores the new ones back — the cross-tick warm start that makes
+/// a sequence of similar QPs cheap. Other backends ignore the
+/// workspace.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_qp_warm(
+    h: &DMatrix<f64>,
+    c: &DVector<f64>,
+    a_eq: Option<&DMatrix<f64>>,
+    b_eq: Option<&DVector<f64>>,
+    a_iq: Option<&DMatrix<f64>>,
+    b_iq: Option<&DVector<f64>>,
+    x0: Option<&DVector<f64>>,
+    config: &QpConfig,
+    workspace: &mut QpWorkspace,
+) -> QpSolution {
+    solve_qp_impl(h, c, a_eq, b_eq, a_iq, b_iq, x0, config, Some(workspace))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_qp_impl(
+    h: &DMatrix<f64>,
+    c: &DVector<f64>,
+    a_eq: Option<&DMatrix<f64>>,
+    b_eq: Option<&DVector<f64>>,
+    a_iq: Option<&DMatrix<f64>>,
+    b_iq: Option<&DVector<f64>>,
+    x0: Option<&DVector<f64>>,
+    config: &QpConfig,
+    workspace: Option<&mut QpWorkspace>,
 ) -> QpSolution {
     // Apply proximal warm-start: when prox_weight > 0 AND x0 is given,
     // augment the cost with (ρ/2)·‖x − x0‖² = (ρ/2)·xᵀx − ρ·x0ᵀx + const.
@@ -189,7 +254,7 @@ pub fn solve_qp(
 
     let mut sol = match config.solver {
         QpSolver::ActiveSet => {
-            solve_qp_active_set(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, x0, config)
+            solve_qp_active_set(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, x0, config, workspace)
         }
         QpSolver::Clarabel => {
             #[cfg(feature = "clarabel")]
@@ -218,7 +283,22 @@ pub fn solve_qp(
 
 // ─── Active-set backend ─────────────────────────────────────────────────────
 
-/// Built-in primal active-set QP solver.
+/// Built-in primal active-set QP solver, with two qpOASES-style
+/// upgrades over the textbook method:
+///
+/// 1. **Incremental factor updates** ([`ActiveFactor`]): the Schur
+///    complement `S = Â·H⁻¹·Âᵀ` and the cached `H⁻¹·Âᵀ` columns are
+///    maintained across working-set changes (O(m²) append / delete)
+///    instead of being rebuilt and LU-factorised every iteration
+///    (O(n²·m + m³)).
+/// 2. **Warm-started working set** ([`QpWorkspace`]): start from the
+///    previous solve's optimum (re-projected onto the new equality
+///    manifold) and its working set — a repeated QP re-solves in O(1)
+///    iterations, a gently perturbed one in a few.
+///
+/// Plus Bland's anti-cycling rule as a fallback once the iteration
+/// count suggests degeneracy.
+#[allow(clippy::too_many_arguments)]
 fn solve_qp_active_set(
     h: &DMatrix<f64>,
     c: &DVector<f64>,
@@ -228,6 +308,7 @@ fn solve_qp_active_set(
     b_iq: Option<&DVector<f64>>,
     x0: Option<&DVector<f64>>,
     config: &QpConfig,
+    mut workspace: Option<&mut QpWorkspace>,
 ) -> QpSolution {
     let n = h.nrows();
     assert_eq!(h.ncols(), n, "H must be square");
@@ -251,125 +332,391 @@ fn solve_qp_active_set(
         }
     };
 
-    // ── Initial feasible point ───────────────────────────────────────
-    let mut x = match x0 {
-        Some(v) => {
-            assert_eq!(v.nrows(), n, "x0 length must match H dimension");
-            v.clone()
+    // ── Starting point: warm workspace → caller x0 → cold Phase-1 ────
+    let mut seed: Vec<usize> = Vec::new();
+    let mut warm = false;
+    let mut x = 'start: {
+        if let Some(w) = workspace.as_deref() {
+            if let Some(px) = &w.x {
+                if px.len() == n && w.working_set.iter().all(|&i| i < m_iq) {
+                    let mut xw = px.clone();
+                    if m_eq > 0 {
+                        let r = &ae * &xw - &be;
+                        if r.norm() > config.feasibility_tol * (1.0 + be.norm().max(1.0)) {
+                            // Re-project onto the new equality manifold:
+                            //   x ← x − Aᵀ(AAᵀ)⁻¹(Ax − b)
+                            let aat = &ae * ae.transpose();
+                            match aat.lu().solve(&r) {
+                                Some(y) => xw -= ae.transpose() * y,
+                                None => break 'start cold_start(n, &ae, &be, &ai, &bi, x0, config),
+                            }
+                        }
+                    }
+                    // The previous optimum sits ON its active rows, so a
+                    // perturbed problem leaves it slightly infeasible —
+                    // repair instead of rejecting (the pragmatic stand-in
+                    // for qpOASES's homotopy).
+                    if push_into_iq_feasible(&mut xw, &ae, &ai, &bi, config) {
+                        // Keep only the previously-active rows that are
+                        // still tight at the (possibly projected) point.
+                        seed = w
+                            .working_set
+                            .iter()
+                            .copied()
+                            .filter(|&i| {
+                                (row_dot(&ai, i, &xw) - bi[i]).abs()
+                                    <= config.feasibility_tol.max(1e-12)
+                            })
+                            .collect();
+                        warm = true;
+                        break 'start xw;
+                    }
+                }
+            }
         }
-        None => initial_feasible(n, &ae, &be, &ai, &bi, config),
+        cold_start(n, &ae, &be, &ai, &bi, x0, config)
     };
 
-    // Verify feasibility
+    // Verify feasibility (guards both start paths).
     if m_eq > 0 {
         let residual = (&ae * &x - &be).norm();
         if residual > config.feasibility_tol * (1.0 + be.norm().max(1.0)) {
             return fail(n, m_eq, m_iq, QpStatus::Infeasible);
         }
     }
-    if m_iq > 0 {
-        let vals = &ai * &x;
+    for i in 0..m_iq {
+        if row_dot(&ai, i, &x) > bi[i] + config.feasibility_tol {
+            return fail(n, m_eq, m_iq, QpStatus::Infeasible);
+        }
+    }
+
+    // ── Working set: warm seed, or every inequality active at x ──────
+    if !warm {
         for i in 0..m_iq {
-            if vals[i] > bi[i] + config.feasibility_tol {
-                return fail(n, m_eq, m_iq, QpStatus::Infeasible);
+            if row_dot(&ai, i, &x) >= bi[i] - config.feasibility_tol {
+                seed.push(i);
             }
         }
     }
 
-    // ── Working set: active inequalities at x ────────────────────────
-    let mut ws: Vec<usize> = Vec::new();
-    if m_iq > 0 {
-        let vals = &ai * &x;
-        for i in 0..m_iq {
-            if vals[i] >= bi[i] - config.feasibility_tol {
-                ws.push(i);
-            }
+    // ── Incremental active factor: equalities, then the seed ─────────
+    let mut fac = ActiveFactor::with_capacity(m_eq + m_iq.min(n) + 4);
+    for i in 0..m_eq {
+        let row: DVector<f64> = ae.row(i).transpose().into_owned();
+        if !fac.try_push(row, &chol) {
+            // Linearly dependent equalities (singular Schur complement).
+            return make_sol(
+                x,
+                h,
+                c,
+                DVector::zeros(m_eq),
+                DVector::zeros(m_iq),
+                QpStatus::NumericalFailure,
+                0,
+            );
         }
+    }
+    let mut ws_idx: Vec<usize> = Vec::new();
+    let mut in_ws = vec![false; m_iq];
+    for i in seed {
+        if in_ws[i] {
+            continue;
+        }
+        let row: DVector<f64> = ai.row(i).transpose().into_owned();
+        if fac.try_push(row, &chol) {
+            ws_idx.push(i);
+            in_ws[i] = true;
+        } // linearly dependent seed rows are simply skipped
     }
 
     // ── Active-set iterations ────────────────────────────────────────
     let mut lam_eq = DVector::zeros(m_eq);
     let mut lam_iq = DVector::zeros(m_iq);
+    // After this many iterations assume degeneracy and switch the
+    // leaving-constraint choice to Bland's rule (lowest index), which
+    // cannot cycle.
+    let bland_after = 2 * (m_iq + n) + 10;
 
     for iter in 0..config.max_iters {
         let grad = h * &x + c;
-        let m_w = ws.len();
-        let m_act = m_eq + m_w;
+        let m_w = ws_idx.len();
 
-        if m_act == 0 {
+        if fac.len() == 0 {
             // Unconstrained step
             let p = chol.solve(&(-&grad));
             if p.norm() < config.optimality_tol {
+                stash(workspace.as_deref_mut(), &x, &ws_idx);
                 return optimal(x, h, c, lam_eq, lam_iq, iter);
             }
-            let (alpha, blocking) = step_length(&x, &p, &ai, &bi, &ws, config);
+            let (alpha, blocking) = step_length(&x, &p, &ai, &bi, &in_ws, config);
             x += alpha * &p;
             if let Some(idx) = blocking {
-                ws.push(idx);
+                let row: DVector<f64> = ai.row(idx).transpose().into_owned();
+                if fac.try_push(row, &chol) {
+                    ws_idx.push(idx);
+                    in_ws[idx] = true;
+                }
             }
         } else {
-            // Build active constraint matrix  Â = [A_eq; A_W]
-            let a_act = build_active_matrix(&ae, &ai, &ws, m_eq, n);
-
-            // Schur complement: S = Â H⁻¹ Âᵀ
-            let h_inv_at = chol.solve(&a_act.transpose());
-            let s = &a_act * &h_inv_at;
-
-            let r = -&grad;
-            let h_inv_r = chol.solve(&r);
-            let rhs = &a_act * &h_inv_r;
-
-            let nu = match s.clone().lu().solve(&rhs) {
-                Some(v) => v,
-                None => {
-                    // Singular Schur complement → dependent constraints
-                    if m_w > 0 {
-                        ws.pop();
-                        continue;
-                    }
-                    return make_sol(x, h, c, lam_eq, lam_iq, QpStatus::NumericalFailure, iter);
-                }
-            };
-
-            let p = &h_inv_r - &h_inv_at * &nu;
+            // Equality-constrained subproblem through the live factor:
+            //   min ½pᵀHp + gᵀp  s.t.  Â p = 0
+            let h_inv_r = chol.solve(&(-&grad));
+            let rhs = fac.dot_rows(&h_inv_r);
+            let nu = fac.solve_schur(&rhs);
+            let p = fac.project(&h_inv_r, &nu);
 
             if p.norm() < config.optimality_tol {
-                // ── Check multipliers for active inequalities ────
-                let mut all_ok = true;
-                let mut worst_val = 0.0;
-                let mut worst_k = 0usize;
-
-                for k in 0..m_w {
-                    let mu = nu[m_eq + k];
-                    if mu < -config.optimality_tol && mu < worst_val {
-                        all_ok = false;
-                        worst_val = mu;
-                        worst_k = k;
+                // ── Choose a leaving constraint (if any) ──────────
+                let mut leave: Option<usize> = None; // position in ws_idx
+                if iter >= bland_after {
+                    // Bland: lowest constraint index with μ < 0.
+                    let mut best: Option<(usize, usize)> = None;
+                    for k in 0..m_w {
+                        let mu = nu[m_eq + k];
+                        if mu < -config.optimality_tol {
+                            let ci = ws_idx[k];
+                            if best.is_none_or(|(bc, _)| ci < bc) {
+                                best = Some((ci, k));
+                            }
+                        }
+                    }
+                    leave = best.map(|(_, k)| k);
+                } else {
+                    // Standard: most negative multiplier.
+                    let mut worst = 0.0;
+                    for k in 0..m_w {
+                        let mu = nu[m_eq + k];
+                        if mu < -config.optimality_tol && mu < worst {
+                            worst = mu;
+                            leave = Some(k);
+                        }
                     }
                 }
 
-                if all_ok {
-                    for i in 0..m_eq {
-                        lam_eq[i] = nu[i];
+                match leave {
+                    None => {
+                        for i in 0..m_eq {
+                            lam_eq[i] = nu[i];
+                        }
+                        for (k, &wi) in ws_idx.iter().enumerate() {
+                            lam_iq[wi] = nu[m_eq + k];
+                        }
+                        stash(workspace.as_deref_mut(), &x, &ws_idx);
+                        return optimal(x, h, c, lam_eq, lam_iq, iter);
                     }
-                    for (k, &wi) in ws.iter().enumerate() {
-                        lam_iq[wi] = nu[m_eq + k];
+                    Some(k) => {
+                        fac.remove(m_eq + k);
+                        in_ws[ws_idx[k]] = false;
+                        ws_idx.remove(k);
                     }
-                    return optimal(x, h, c, lam_eq, lam_iq, iter);
-                } else {
-                    ws.remove(worst_k);
                 }
             } else {
-                let (alpha, blocking) = step_length(&x, &p, &ai, &bi, &ws, config);
+                let (alpha, blocking) = step_length(&x, &p, &ai, &bi, &in_ws, config);
                 x += alpha * &p;
                 if let Some(idx) = blocking {
-                    ws.push(idx);
+                    let row: DVector<f64> = ai.row(idx).transpose().into_owned();
+                    if fac.try_push(row, &chol) {
+                        ws_idx.push(idx);
+                        in_ws[idx] = true;
+                    } else if let Some(&last) = ws_idx.last() {
+                        // Blocking row linearly dependent on the active
+                        // set: relax the most recent working constraint
+                        // and retry (mirrors the previous
+                        // implementation's singular-Schur handling).
+                        fac.remove(m_eq + ws_idx.len() - 1);
+                        in_ws[last] = false;
+                        ws_idx.pop();
+                    } else {
+                        stash(workspace.as_deref_mut(), &x, &ws_idx);
+                        return make_sol(
+                            x,
+                            h,
+                            c,
+                            lam_eq,
+                            lam_iq,
+                            QpStatus::NumericalFailure,
+                            iter,
+                        );
+                    }
                 }
             }
         }
     }
 
+    stash(workspace.as_deref_mut(), &x, &ws_idx);
     make_sol(x, h, c, lam_eq, lam_iq, QpStatus::MaxIterations, config.max_iters)
+}
+
+/// Cold-start point: the caller's `x0`, else Phase-1.
+fn cold_start(
+    n: usize,
+    ae: &DMatrix<f64>,
+    be: &DVector<f64>,
+    ai: &DMatrix<f64>,
+    bi: &DVector<f64>,
+    x0: Option<&DVector<f64>>,
+    config: &QpConfig,
+) -> DVector<f64> {
+    match x0 {
+        Some(v) => {
+            assert_eq!(v.nrows(), n, "x0 length must match H dimension");
+            v.clone()
+        }
+        None => initial_feasible(n, ae, be, ai, bi, config),
+    }
+}
+
+/// Store the exit state into the caller's workspace (if any).
+fn stash(w: Option<&mut QpWorkspace>, x: &DVector<f64>, ws: &[usize]) {
+    if let Some(w) = w {
+        w.x = Some(x.clone());
+        w.working_set = ws.to_vec();
+    }
+}
+
+/// Incrementally-factorised active-constraint block: the active rows Â
+/// (equalities first, then the working set), their cached `H⁻¹·âᵢᵀ`
+/// columns, and a Cholesky factor of the Schur complement
+/// `S = Â·H⁻¹·Âᵀ`, maintained by O(m²) append / delete updates instead
+/// of an O(m³) refactorisation per active-set change — the qpOASES
+/// factor-update idea that makes each iteration cheap.
+struct ActiveFactor {
+    rows: Vec<DVector<f64>>,
+    y: Vec<DVector<f64>>,
+    /// Lower-triangular factor of S; the live block is `m × m`.
+    l: DMatrix<f64>,
+    m: usize,
+}
+
+impl ActiveFactor {
+    fn with_capacity(cap: usize) -> Self {
+        ActiveFactor {
+            rows: Vec::with_capacity(cap),
+            y: Vec::with_capacity(cap),
+            l: DMatrix::zeros(cap.max(1), cap.max(1)),
+            m: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.m
+    }
+
+    fn ensure_capacity(&mut self) {
+        if self.m == self.l.nrows() {
+            let cap = self.l.nrows() * 2;
+            let mut nl = DMatrix::zeros(cap, cap);
+            nl.view_mut((0, 0), (self.m, self.m))
+                .copy_from(&self.l.view((0, 0), (self.m, self.m)));
+            self.l = nl;
+        }
+    }
+
+    /// Append one constraint row. Returns `false` (and leaves the factor
+    /// untouched) if the row is linearly dependent on the active rows —
+    /// the case that made the previous implementation's Schur LU
+    /// singular.
+    fn try_push(&mut self, row: DVector<f64>, chol: &Cholesky<f64, Dyn>) -> bool {
+        self.ensure_capacity();
+        let y = chol.solve(&row);
+        let m = self.m;
+        // New Schur column sⱼ = âⱼ·y, forward-substituted through L.
+        let mut w = DVector::zeros(m);
+        for j in 0..m {
+            let mut acc = self.rows[j].dot(&y);
+            for t in 0..j {
+                acc -= self.l[(j, t)] * w[t];
+            }
+            w[j] = acc / self.l[(j, j)];
+        }
+        let d = row.dot(&y);
+        let d2 = d - w.norm_squared();
+        if d2 <= 1e-12 * d.abs().max(1.0) {
+            return false;
+        }
+        for j in 0..m {
+            self.l[(m, j)] = w[j];
+        }
+        self.l[(m, m)] = d2.sqrt();
+        self.rows.push(row);
+        self.y.push(y);
+        self.m += 1;
+        true
+    }
+
+    /// Remove the active row at position `k`: shift the trailing factor
+    /// block up-left and repair it with a rank-one update by the deleted
+    /// column (classic `cholupdate`), O((m−k)²).
+    fn remove(&mut self, k: usize) {
+        let m = self.m;
+        debug_assert!(k < m);
+        let t = m - k - 1;
+        let mut v = DVector::zeros(t);
+        for i in 0..t {
+            v[i] = self.l[(k + 1 + i, k)];
+        }
+        for i in k..(m - 1) {
+            for j in 0..=i {
+                let jj = if j < k { j } else { j + 1 };
+                self.l[(i, j)] = self.l[(i + 1, jj)];
+            }
+        }
+        self.m = m - 1;
+        // Trailing block: L'·L'ᵀ = L·Lᵀ + v·vᵀ.
+        for j in 0..t {
+            let jj = k + j;
+            let ljj = self.l[(jj, jj)];
+            let r = ljj.hypot(v[j]);
+            let cth = r / ljj;
+            let sth = v[j] / ljj;
+            self.l[(jj, jj)] = r;
+            for i in (j + 1)..t {
+                let ii = k + i;
+                let lij = self.l[(ii, jj)];
+                self.l[(ii, jj)] = (lij + sth * v[i]) / cth;
+                v[i] = cth * v[i] - sth * self.l[(ii, jj)];
+            }
+        }
+        self.rows.remove(k);
+        self.y.remove(k);
+    }
+
+    /// `Â·z`.
+    fn dot_rows(&self, z: &DVector<f64>) -> DVector<f64> {
+        DVector::from_fn(self.m, |j, _| self.rows[j].dot(z))
+    }
+
+    /// Solve `S·ν = rhs` through the maintained factor (two triangular
+    /// substitutions).
+    fn solve_schur(&self, rhs: &DVector<f64>) -> DVector<f64> {
+        let m = self.m;
+        let mut w = DVector::zeros(m);
+        for i in 0..m {
+            let mut acc = rhs[i];
+            for j in 0..i {
+                acc -= self.l[(i, j)] * w[j];
+            }
+            w[i] = acc / self.l[(i, i)];
+        }
+        let mut nu = DVector::zeros(m);
+        for i in (0..m).rev() {
+            let mut acc = w[i];
+            for j in (i + 1)..m {
+                acc -= self.l[(j, i)] * nu[j];
+            }
+            nu[i] = acc / self.l[(i, i)];
+        }
+        nu
+    }
+
+    /// `p = h_inv_r − (H⁻¹Âᵀ)·ν` from the cached columns.
+    fn project(&self, h_inv_r: &DVector<f64>, nu: &DVector<f64>) -> DVector<f64> {
+        let mut p = h_inv_r.clone();
+        for j in 0..self.m {
+            p.axpy(-nu[j], &self.y[j], 1.0);
+        }
+        p
+    }
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────────
@@ -430,17 +777,44 @@ fn initial_feasible(
     }
 
     // The least-norm equality-feasible point violates some inequality.
-    // Project into the feasible set via the null space of A_eq.
-    // Null-space projector: P = I − Aᵀ (A Aᵀ)⁻¹ A
-    let aat_inv = match aat.lu().solve(&DMatrix::identity(m_eq, m_eq)) {
-        Some(v) => v,
-        None => return x0, // fallback
-    };
-    let proj_null = DMatrix::identity(n, n) - ae.transpose() * &aat_inv * ae;
-
     let mut x = x0;
+    push_into_iq_feasible(&mut x, ae, ai, bi, config);
+    x
+}
+
+/// Reduce inequality violations of `x` by moving along the equality
+/// null space (violated rows are projected out one at a time, worst
+/// first). Returns whether `x` ended inside the feasible set. Used by
+/// the cold Phase-1 and by the warm-start path, whose previous-tick
+/// optimum sits ON its active constraints and therefore drifts slightly
+/// outside after any perturbation.
+fn push_into_iq_feasible(
+    x: &mut DVector<f64>,
+    ae: &DMatrix<f64>,
+    ai: &DMatrix<f64>,
+    bi: &DVector<f64>,
+    config: &QpConfig,
+) -> bool {
+    let n = x.len();
+    let m_eq = ae.nrows();
+    let m_iq = ai.nrows();
+    if m_iq == 0 {
+        return true;
+    }
+
+    // Null-space projector: P = I − Aᵀ (A Aᵀ)⁻¹ A  (identity when no eq).
+    let proj_null = if m_eq > 0 {
+        let aat = ae * ae.transpose();
+        match aat.lu().solve(&DMatrix::identity(m_eq, m_eq)) {
+            Some(aat_inv) => DMatrix::identity(n, n) - ae.transpose() * &aat_inv * ae,
+            None => return false,
+        }
+    } else {
+        DMatrix::identity(n, n)
+    };
+
     for _ in 0..200 {
-        let vals = ai * &x;
+        let vals = ai * &*x;
         let mut max_viol = f64::NEG_INFINITY;
         let mut worst = 0usize;
         for i in 0..m_iq {
@@ -451,38 +825,20 @@ fn initial_feasible(
             }
         }
         if max_viol <= config.feasibility_tol {
-            return x;
+            return true;
         }
 
-        // Move x along the null-space projection of a_worst to reduce violation.
+        // Move x along the null-space projection of a_worst.
         let ai_col: DVector<f64> = ai.row(worst).transpose().into_owned();
         let p_ai = &proj_null * &ai_col;
         let denom = ai_col.dot(&p_ai);
         if denom < 1e-15 {
-            break; // cannot move in null space
+            return false; // cannot move in null space
         }
         let alpha = max_viol / denom;
-        x -= alpha * p_ai;
+        *x -= alpha * p_ai;
     }
-    x
-}
-
-fn build_active_matrix(
-    ae: &DMatrix<f64>,
-    ai: &DMatrix<f64>,
-    ws: &[usize],
-    m_eq: usize,
-    n: usize,
-) -> DMatrix<f64> {
-    let m_act = m_eq + ws.len();
-    let mut a = DMatrix::zeros(m_act, n);
-    for i in 0..m_eq {
-        a.row_mut(i).copy_from(&ae.row(i));
-    }
-    for (k, &wi) in ws.iter().enumerate() {
-        a.row_mut(m_eq + k).copy_from(&ai.row(wi));
-    }
-    a
+    false
 }
 
 fn step_length(
@@ -490,7 +846,7 @@ fn step_length(
     p: &DVector<f64>,
     ai: &DMatrix<f64>,
     bi: &DVector<f64>,
-    ws: &[usize],
+    in_ws: &[bool],
     config: &QpConfig,
 ) -> (f64, Option<usize>) {
     let m_iq = ai.nrows();
@@ -501,7 +857,7 @@ fn step_length(
     let mut blocking = None;
 
     for i in 0..m_iq {
-        if ws.contains(&i) {
+        if in_ws[i] {
             continue;
         }
         let ai_p = row_dot(ai, i, p);
@@ -1272,4 +1628,130 @@ mod tests {
         let b_iq = DVector::from_vec(vec![1.0, 1.0, 1.0, 1.0]);
         cross_validate(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, 1e-6);
     }
+    // ─── Warm-start workspace (qpOASES-style online active set) ─────
+
+    /// A tiny deterministic LCG for the randomised warm-start tests.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_f64(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        }
+    }
+
+    /// A well-conditioned random QP with equalities and inequalities.
+    fn random_qp(
+        rng: &mut Lcg,
+        n: usize,
+        m_eq: usize,
+        m_iq: usize,
+    ) -> (DMatrix<f64>, DVector<f64>, DMatrix<f64>, DVector<f64>, DMatrix<f64>, DVector<f64>) {
+        let a = DMatrix::from_fn(n, n, |_, _| rng.next_f64());
+        let h = &a * a.transpose() + DMatrix::identity(n, n);
+        let c = DVector::from_fn(n, |_, _| rng.next_f64());
+        let ae = DMatrix::from_fn(m_eq, n, |_, _| rng.next_f64());
+        let be = DVector::from_fn(m_eq, |_, _| rng.next_f64() * 0.3);
+        let ai = DMatrix::from_fn(m_iq, n, |_, _| rng.next_f64());
+        // Loose enough that a feasible region exists, tight enough that
+        // several rows go active at the optimum.
+        let bi = DVector::from_fn(m_iq, |_, _| rng.next_f64().abs() * 0.5 + 0.05);
+        (h, c, ae, be, ai, bi)
+    }
+
+    /// KKT residuals of a returned solution — backend-independent
+    /// optimality certificate (stationarity, primal feasibility, dual
+    /// feasibility, complementary slackness).
+    fn assert_kkt(
+        h: &DMatrix<f64>,
+        c: &DVector<f64>,
+        ae: &DMatrix<f64>,
+        be: &DVector<f64>,
+        ai: &DMatrix<f64>,
+        bi: &DVector<f64>,
+        sol: &QpSolution,
+    ) {
+        assert_eq!(sol.status, QpStatus::Optimal, "not optimal");
+        let x = &sol.x;
+        let stat = h * x + c + ae.transpose() * &sol.lambda_eq + ai.transpose() * &sol.lambda_iq;
+        assert!(stat.norm() < 1e-5, "stationarity violated: {}", stat.norm());
+        if ae.nrows() > 0 {
+            assert!((ae * x - be).norm() < 1e-6, "eq violated");
+        }
+        for i in 0..ai.nrows() {
+            let slack = bi[i] - (ai.row(i) * x)[0];
+            assert!(slack > -1e-6, "iq {i} violated: slack {slack}");
+            assert!(sol.lambda_iq[i] > -1e-6, "dual feasibility violated at {i}");
+            assert!(
+                sol.lambda_iq[i].abs() * slack.abs() < 1e-4,
+                "complementary slackness violated at {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_set_satisfies_kkt_on_random_problems() {
+        // Hammers the incremental add / remove factor paths.
+        let mut rng = Lcg(0xFEED);
+        let cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        for _ in 0..25 {
+            let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 10, 3, 12);
+            let sol = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            assert_kkt(&h, &c, &ae, &be, &ai, &bi, &sol);
+        }
+    }
+
+    #[test]
+    fn warm_resolve_of_identical_qp_is_one_iteration() {
+        let mut rng = Lcg(0xBEEF);
+        let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 12, 3, 14);
+        let cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let mut ws = QpWorkspace::new();
+
+        let cold =
+            solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+        assert_eq!(cold.status, QpStatus::Optimal);
+        assert!(cold.iterations > 0, "cold solve should iterate");
+
+        let warm =
+            solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+        assert_eq!(warm.status, QpStatus::Optimal);
+        assert!(
+            warm.iterations <= 1,
+            "warm re-solve took {} iterations (cold took {})",
+            warm.iterations,
+            cold.iterations
+        );
+        assert!((&warm.x - &cold.x).norm() < 1e-8, "warm x drifted");
+    }
+
+    #[test]
+    fn warm_workspace_tracks_a_perturbed_tick_sequence() {
+        // A drifting QP sequence (b_eq and c move every tick) — warm
+        // restarts must stay correct (KKT) and cheaper than cold.
+        let mut rng = Lcg(0xCAFE);
+        let (h, c0, ae, be0, ai, bi) = random_qp(&mut rng, 12, 3, 14);
+        let cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let mut ws = QpWorkspace::new();
+        let mut warm_iters = 0usize;
+        let mut cold_iters = 0usize;
+
+        for t in 0..20 {
+            let phase = t as f64 * 0.15;
+            let c = &c0 + DVector::from_fn(c0.len(), |i, _| 0.01 * (phase + i as f64).sin());
+            let be = &be0 + DVector::from_fn(be0.len(), |i, _| 0.005 * (phase * 1.3 + i as f64).cos());
+
+            let warm = solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+            assert_kkt(&h, &c, &ae, &be, &ai, &bi, &warm);
+            warm_iters += warm.iterations;
+
+            let cold = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            cold_iters += cold.iterations;
+            assert!((&warm.x - &cold.x).norm() < 1e-6, "tick {t}: warm and cold disagree");
+        }
+        assert!(
+            warm_iters < cold_iters,
+            "warm restarts should beat cold starts: {warm_iters} vs {cold_iters}"
+        );
+    }
+
 }
