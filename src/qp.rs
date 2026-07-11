@@ -63,6 +63,21 @@ pub enum QpSolver {
     /// point method but a mature conic one; this variant exists to
     /// study the IPM approach itself, not to outperform Clarabel.
     Ipm,
+    /// [`Ipm`](QpSolver::Ipm) plus Gondzio's multiple centrality
+    /// correctors (Colombo & Gondzio 2008): after the usual
+    /// predictor + Mehrotra-corrector step, up to a few extra cheap
+    /// back-substitutions against the *same* factorisation nudge
+    /// outlier complementarity products back toward the target,
+    /// enlarging the step length. **Measured to help on large,
+    /// sparse LPs (the setting the technique was designed for) but
+    /// to be a net loss at misa-wbc's scale** — on dense random QPs
+    /// from n=5 to n=320 the extra solves/line-search per iteration
+    /// cost more than the (near-zero, at this density/scale) drop in
+    /// outer iterations bought back. Kept as a separate variant
+    /// (rather than folded into `Ipm`'s default behaviour) precisely
+    /// because of that measured regression — pick it only to compare
+    /// against `Ipm`, not as a general speed-up.
+    IpmMcc,
     /// Built-in operator-splitting (ADMM) QP solver, dense, no
     /// external dependencies. A from-scratch, textbook implementation
     /// of the OSQP algorithm (Stellato et al. 2020) — a third
@@ -277,7 +292,8 @@ fn solve_qp_impl(
         QpSolver::ActiveSet => {
             solve_qp_active_set(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, x0, config, workspace)
         }
-        QpSolver::Ipm => solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config),
+        QpSolver::Ipm => solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config, false),
+        QpSolver::IpmMcc => solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config, true),
         QpSolver::Admm => solve_qp_admm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config),
         QpSolver::Clarabel => {
             #[cfg(feature = "clarabel")]
@@ -1328,6 +1344,7 @@ fn solve_qp_ipm(
     a_iq: Option<&DMatrix<f64>>,
     b_iq: Option<&DVector<f64>>,
     config: &QpConfig,
+    mcc: bool,
 ) -> QpSolution {
     let n = h.nrows();
     assert_eq!(h.ncols(), n, "H must be square");
@@ -1432,16 +1449,96 @@ fn solve_qp_ipm(
         let Some((dx, dy)) = solve_reduced_kkt(&h_bar, &ae, &rhs_x(&t_cor), &(-&r_eq)) else {
             return make_sol(x, h, c, y, z, QpStatus::NumericalFailure, iters);
         };
-        let ds = -&r_iq - &ai * &dx;
-        let dz = dz_from(&t_cor, &ds);
+        let mut dp_x = dx;
+        let mut dp_y = dy;
+        let mut dp_s = -&r_iq - &ai * &dp_x;
+        let mut dp_z = dz_from(&t_cor, &dp_s);
 
-        let alpha_p = fraction_to_boundary(&s, &ds, TAU);
-        let alpha_d = fraction_to_boundary(&z, &dz, TAU);
+        // ── Gondzio's multiple centrality correctors ───────────────
+        //
+        // The predictor+Mehrotra-corrector direction Δp above is a good
+        // guess, but it is optimistic (it targets complementarity = μ
+        // everywhere) and its step length is limited by whichever
+        // component of (s, z) hits the boundary first. Gondzio's
+        // technique (Colombo & Gondzio 2008, eq. 7) reuses the SAME
+        // factorised `h_bar` — no new factorisation, just extra cheap
+        // back-substitutions — to compute extra correction directions
+        // that push only the OUTLIER complementarity products (those
+        // that would end up far from μ at a trial step) back toward a
+        // reasonable range, which enlarges the step Δp can take.
+        const MAX_CORRECTORS: usize = 3;
+        const ASPIRATION: f64 = 0.1; // δ: how much extra step length we chase per round
+        const GAMMA: f64 = 0.1; // γ: outlier band (γμ, γ⁻¹μ) that needs no correction
+        const LINE_SEARCH_POINTS: usize = 8; // ω grid resolution in [0, 1]
 
-        x += alpha_p * &dx;
-        s += alpha_p * &ds;
-        y += alpha_d * &dy;
-        z += alpha_d * &dz;
+        for _ in 0..(if mcc { MAX_CORRECTORS } else { 0 }) {
+            let alpha_p = fraction_to_boundary(&s, &dp_s, 1.0);
+            let alpha_d = fraction_to_boundary(&z, &dp_z, 1.0);
+            if alpha_p >= 1.0 - 1e-9 && alpha_d >= 1.0 - 1e-9 {
+                break; // already reaches the boundary; no aspiration room left
+            }
+
+            // Trial point at the aspired (enlarged) step length.
+            let target_p = (alpha_p + ASPIRATION).min(1.0);
+            let target_d = (alpha_d + ASPIRATION).min(1.0);
+            let s_trial = &s + target_p * &dp_s;
+            let z_trial = &z + target_d * &dp_z;
+
+            // Target only the outliers toward the (γμ, γ⁻¹μ) band —
+            // components already inside it are left alone (eq. 7).
+            let t_mcc = DVector::from_fn(m_iq, |i, _| {
+                let v = s_trial[i] * z_trial[i];
+                if v <= GAMMA * mu {
+                    GAMMA * mu - v
+                } else if v >= mu / GAMMA {
+                    mu / GAMMA - v
+                } else {
+                    0.0
+                }
+            });
+
+            // Pure centrality corrector: stationarity/eq-feasibility
+            // residuals are 0 here (only the complementarity target is
+            // non-zero), reusing the SAME h_bar factorisation.
+            let zero_eq = DVector::zeros(m_eq);
+            let rhs_m = -ai.transpose() * DVector::from_fn(m_iq, |i, _| t_mcc[i] / s[i]);
+            let Some((dm_x, dm_y)) = solve_reduced_kkt(&h_bar, &ae, &rhs_m, &zero_eq) else {
+                break; // keep Δp as-is rather than aborting an otherwise-good step
+            };
+            let dm_s = -&ai * &dm_x;
+            let dm_z = dz_from(&t_mcc, &dm_s);
+
+            // Line-search ω ∈ [0, 1] for Δ = Δp + ω·Δm maximising the
+            // achievable step-length product α_P·α_D.
+            let base_product = alpha_p * alpha_d;
+            let mut best = (0.0_f64, base_product);
+            for k in 1..=LINE_SEARCH_POINTS {
+                let omega = k as f64 / LINE_SEARCH_POINTS as f64;
+                let cs = &dp_s + omega * &dm_s;
+                let cz = &dp_z + omega * &dm_z;
+                let ap = fraction_to_boundary(&s, &cs, 1.0);
+                let ad = fraction_to_boundary(&z, &cz, 1.0);
+                if ap * ad > best.1 {
+                    best = (omega, ap * ad);
+                }
+            }
+            if best.0 <= 0.0 {
+                break; // no ω improved the step length; further correctors won't help
+            }
+
+            dp_x += best.0 * dm_x;
+            dp_y += best.0 * dm_y;
+            dp_s += best.0 * dm_s;
+            dp_z += best.0 * dm_z;
+        }
+
+        let alpha_p = fraction_to_boundary(&s, &dp_s, TAU);
+        let alpha_d = fraction_to_boundary(&z, &dp_z, TAU);
+
+        x += alpha_p * &dp_x;
+        s += alpha_p * &dp_s;
+        y += alpha_d * &dp_y;
+        z += alpha_d * &dp_z;
     }
 
     make_sol(x, h, c, y, z, QpStatus::MaxIterations, iters)
@@ -2432,6 +2529,61 @@ mod tests {
         let cfg = QpConfig { solver: QpSolver::Ipm, max_iters: 0, ..Default::default() };
         let sol = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
         assert_eq!(sol.status, QpStatus::MaxIterations);
+    }
+
+    // ─── IpmMcc (Gondzio's multiple centrality correctors) ───────────
+
+    #[test]
+    fn ipm_mcc_satisfies_kkt_on_random_problems() {
+        let mut rng = Lcg(0xC0FFEE);
+        let cfg = QpConfig { solver: QpSolver::IpmMcc, ..Default::default() };
+        for _ in 0..25 {
+            let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 10, 3, 12);
+            let sol = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            assert_kkt(&h, &c, &ae, &be, &ai, &bi, &sol);
+        }
+    }
+
+    #[test]
+    fn ipm_mcc_agrees_with_plain_ipm_on_full_rank_problems() {
+        // Adding centrality correctors changes the path taken, not the
+        // problem: both must land on the same unique optimum.
+        let mut rng = Lcg(0xFACADE);
+        let mcc_cfg = QpConfig { solver: QpSolver::IpmMcc, ..Default::default() };
+        let plain_cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        for _ in 0..15 {
+            let n = 10;
+            let a = DMatrix::from_fn(n, n, |_, _| rng.next_f64());
+            let h = a.transpose() * &a + DMatrix::identity(n, n) * 0.5;
+            let c = DVector::from_fn(n, |_, _| rng.next_f64());
+            let d = DMatrix::from_fn(2 * n, n, |_, _| rng.next_f64());
+            let f = DVector::from_fn(2 * n, |_, _| rng.next_f64().abs() * 0.5 + 0.1);
+
+            let mcc = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &mcc_cfg);
+            let plain = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &plain_cfg);
+            assert_eq!(mcc.status, QpStatus::Optimal);
+            assert_eq!(plain.status, QpStatus::Optimal);
+            assert!(
+                (&mcc.x - &plain.x).norm() < 1e-4,
+                "ipm/ipm-mcc disagree: {:?} vs {:?}",
+                mcc.x,
+                plain.x
+            );
+        }
+    }
+
+    #[test]
+    fn ipm_mcc_solves_equality_only_in_one_newton_step() {
+        // No inequalities: MCC has nothing to correct (m_iq == 0 takes
+        // the same fast path as plain Ipm).
+        let a = DMatrix::from_row_slice(1, 2, &[1.0, 1.0]);
+        let b = DVector::from_vec(vec![1.0]);
+        let h = DMatrix::identity(2, 2);
+        let c = DVector::zeros(2);
+        let cfg = QpConfig { solver: QpSolver::IpmMcc, ..Default::default() };
+        let sol = solve_qp(&h, &c, Some(&a), Some(&b), None, None, None, &cfg);
+        assert_eq!(sol.status, QpStatus::Optimal);
+        assert_eq!(sol.iterations, 2);
     }
 
     // ─── ADMM (operator splitting / OSQP algorithm) ──────────────────
