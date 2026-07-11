@@ -79,6 +79,6 @@ pub use ho_qp::{HoQp, WarmStart};
 pub use qp::{solve_qp, solve_qp_warm, QpConfig, QpSolution, QpSolver, QpStatus, QpWorkspace};
 pub use solve::{
     solve, solve_warm, HqpStrategy, Solution, SolveConfig, SolveStatus, WbcError,
-};
+ Solver};
 pub use task::Task;
 pub use tasks::ContactPatch;

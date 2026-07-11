@@ -320,16 +320,58 @@ fn solve_qp_active_set(
     let m_eq = ae.nrows();
     let m_iq = ai.nrows();
 
-    // ── Cholesky of H (with regularisation fallback) ─────────────────
-    let chol = match h.clone().cholesky() {
-        Some(c) => c,
-        None => {
-            let h_reg = h + &DMatrix::identity(n, n) * 1e-12;
-            match h_reg.cholesky() {
-                Some(c) => c,
-                None => return fail(n, m_eq, m_iq, QpStatus::NumericalFailure),
+    // ── Cholesky of H, with qpOASES-style conditional ridge ──────────
+    // An ill-conditioned H (κ ≳ 1e10 — e.g. AᵀA of a rank-deficient
+    // stack plus a 1e-12 tie-break) makes the EQP steps blow up along
+    // the near-null directions; the step-length clip then advances in
+    // microscopic increments and the method crawls into MaxIterations.
+    // qpOASES's answer is a ridge: iterate on H + ρᵣ·I with ρᵣ scaled
+    // to H, then recover the unregularised optimum with one KKT polish
+    // on the final active set (see the `Optimal` exit below).
+    let mut ridge = 0.0_f64;
+    let chol = {
+        let attempt = |ridge: f64| -> Option<nalgebra::Cholesky<f64, Dyn>> {
+            if ridge == 0.0 {
+                h.clone().cholesky()
+            } else {
+                (h + DMatrix::identity(n, n) * ridge).cholesky()
             }
+        };
+        let mut c = attempt(0.0);
+        // Conditioning check via the Cholesky pivots: κ(H) ≈ (max/min)².
+        let ill = c.as_ref().is_none_or(|c| {
+            let l = c.l_dirty();
+            let mut lo = f64::INFINITY;
+            let mut hi = 0.0_f64;
+            for i in 0..n {
+                let d = l[(i, i)].abs();
+                lo = lo.min(d);
+                hi = hi.max(d);
+            }
+            // κ(H) ≈ (hi/lo)² ≥ 1e8 already crawls (microscopic
+            // step-length clipping); the polish restores exactness, so
+            // over-ridging is safe and under-ridging is not.
+            lo <= 1e-4 * hi
+        });
+        if ill {
+            let scale = (0..n).map(|i| h[(i, i)].abs()).fold(0.0, f64::max).max(1e-12);
+            // Cap the iteration Hessian at κ ≈ 1e6 — comfortably
+            // inside the crawl-free regime; the polish undoes the bias.
+            ridge = 1e-6 * scale;
+            c = attempt(ridge);
         }
+        match c {
+            Some(c) => c,
+            None => return fail(n, m_eq, m_iq, QpStatus::NumericalFailure),
+        }
+    };
+    // The Hessian the ITERATIONS see (grad must match the factor).
+    let h_owned_ridge;
+    let h_it: &DMatrix<f64> = if ridge > 0.0 {
+        h_owned_ridge = h + DMatrix::identity(n, n) * ridge;
+        &h_owned_ridge
+    } else {
+        h
     };
 
     // ── Starting point: warm workspace → caller x0 → cold Phase-1 ────
@@ -438,13 +480,19 @@ fn solve_qp_active_set(
     let bland_after = 2 * (m_iq + n) + 10;
 
     for iter in 0..config.max_iters {
-        let grad = h * &x + c;
+        let grad = h_it * &x + c;
         let m_w = ws_idx.len();
 
         if fac.len() == 0 {
             // Unconstrained step
             let p = chol.solve(&(-&grad));
             if p.norm() < config.optimality_tol {
+                if ridge > 0.0 {
+                    polish(
+                        &mut x, &mut lam_eq, &mut lam_iq, h, c, &ae, &be, &ai, &bi, &ws_idx,
+                        config,
+                    );
+                }
                 stash(workspace.as_deref_mut(), &x, &ws_idx);
                 return optimal(x, h, c, lam_eq, lam_iq, iter);
             }
@@ -500,6 +548,12 @@ fn solve_qp_active_set(
                         }
                         for (k, &wi) in ws_idx.iter().enumerate() {
                             lam_iq[wi] = nu[m_eq + k];
+                        }
+                        if ridge > 0.0 {
+                            polish(
+                                &mut x, &mut lam_eq, &mut lam_iq, h, c, &ae, &be, &ai, &bi,
+                                &ws_idx, config,
+                            );
                         }
                         stash(workspace.as_deref_mut(), &x, &ws_idx);
                         return optimal(x, h, c, lam_eq, lam_iq, iter);
@@ -571,6 +625,82 @@ fn stash(w: Option<&mut QpWorkspace>, x: &DVector<f64>, ws: &[usize]) {
     if let Some(w) = w {
         w.x = Some(x.clone());
         w.working_set = ws.to_vec();
+    }
+}
+
+/// KKT polish (qpOASES's refinement idea): the ridged iterations found
+/// the active set; re-solve the equality-constrained KKT system on that
+/// active set with the ORIGINAL Hessian to recover the unregularised
+/// optimum. Applied only if the polished point stays primal/dual
+/// feasible — otherwise the ridged solution is kept (it solves the
+/// ridged problem exactly and the original one to O(ridge)).
+#[allow(clippy::too_many_arguments)]
+fn polish(
+    x: &mut DVector<f64>,
+    lam_eq: &mut DVector<f64>,
+    lam_iq: &mut DVector<f64>,
+    h: &DMatrix<f64>,
+    c: &DVector<f64>,
+    ae: &DMatrix<f64>,
+    be: &DVector<f64>,
+    ai: &DMatrix<f64>,
+    bi: &DVector<f64>,
+    ws_idx: &[usize],
+    config: &QpConfig,
+) {
+    let n = h.nrows();
+    let m_eq = ae.nrows();
+    let m = m_eq + ws_idx.len();
+
+    // KKT:  [H  Âᵀ][x]   [−c]
+    //       [Â  0 ][ν] = [ b̂]
+    let mut kkt = DMatrix::zeros(n + m, n + m);
+    kkt.view_mut((0, 0), (n, n)).copy_from(h);
+    let mut bhat = DVector::zeros(m);
+    for i in 0..m_eq {
+        for j in 0..n {
+            kkt[(n + i, j)] = ae[(i, j)];
+            kkt[(j, n + i)] = ae[(i, j)];
+        }
+        bhat[i] = be[i];
+    }
+    for (k, &wi) in ws_idx.iter().enumerate() {
+        for j in 0..n {
+            kkt[(n + m_eq + k, j)] = ai[(wi, j)];
+            kkt[(j, n + m_eq + k)] = ai[(wi, j)];
+        }
+        bhat[m_eq + k] = bi[wi];
+    }
+    let mut rhs = DVector::zeros(n + m);
+    for i in 0..n {
+        rhs[i] = -c[i];
+    }
+    for i in 0..m {
+        rhs[n + i] = bhat[i];
+    }
+
+    let Some(sol) = kkt.lu().solve(&rhs) else { return };
+    let xp = sol.rows(0, n).into_owned();
+
+    // Primal feasibility of the inactive inequalities…
+    for i in 0..ai.nrows() {
+        if !ws_idx.contains(&i) && row_dot(ai, i, &xp) > bi[i] + 10.0 * config.feasibility_tol {
+            return;
+        }
+    }
+    // …and dual feasibility of the active ones.
+    for k in 0..ws_idx.len() {
+        if sol[n + m_eq + k] < -10.0 * config.optimality_tol {
+            return;
+        }
+    }
+
+    *x = xp;
+    for i in 0..m_eq {
+        lam_eq[i] = sol[n + i];
+    }
+    for (k, &wi) in ws_idx.iter().enumerate() {
+        lam_iq[wi] = sol[n + m_eq + k];
     }
 }
 
@@ -1752,6 +1882,38 @@ mod tests {
             warm_iters < cold_iters,
             "warm restarts should beat cold starts: {warm_iters} vs {cold_iters}"
         );
+    }
+
+    /// The HoQp-shaped failure mode: H = AᵀA + tiny·I with A rank-
+    /// deficient (κ ≈ 1e8) used to crawl into MaxIterations through
+    /// microscopic clipped steps. The conditional ridge + KKT polish
+    /// must solve it in a handful of iterations AND return the
+    /// unregularised optimum (verified against the KKT conditions of
+    /// the ORIGINAL problem).
+    #[test]
+    fn ill_conditioned_hessian_is_ridged_and_polished() {
+        let n = 42;
+        for rows in [6usize, 15] {
+            let a = DMatrix::from_fn(rows, n, |i, j| ((i * 13 + j * 7) as f64 * 0.37).sin());
+            let h = a.transpose() * &a + DMatrix::identity(n, n) * 1e-8;
+            let b = DVector::from_fn(rows, |i, _| ((i as f64) * 0.9).cos());
+            let c = -(a.transpose() * &b);
+            let d = DMatrix::from_fn(44, n, |i, j| ((i * 5 + j * 3) as f64 * 0.23).cos());
+            let f = DVector::from_fn(44, |i, _| 0.5 + 0.1 * ((i as f64) * 0.7).sin().abs());
+            let cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+
+            let sol = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
+            assert_eq!(sol.status, QpStatus::Optimal, "rows={rows}: crawled");
+            assert!(sol.iterations < 50, "rows={rows}: {} iterations", sol.iterations);
+            // KKT of the ORIGINAL (unridged) problem.
+            let stat = &h * &sol.x + &c + d.transpose() * &sol.lambda_iq;
+            assert!(stat.norm() < 1e-5, "rows={rows}: stationarity {}", stat.norm());
+            for i in 0..44 {
+                let slack = f[i] - (d.row(i) * &sol.x)[0];
+                assert!(slack > -1e-6, "rows={rows}: iq {i} violated");
+                assert!(sol.lambda_iq[i] > -1e-6, "rows={rows}: dual infeasible at {i}");
+            }
+        }
     }
 
 }

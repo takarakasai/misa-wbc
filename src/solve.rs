@@ -19,7 +19,7 @@
 use nalgebra::DVector;
 
 use crate::ho_qp::{HoQp, WarmStart};
-use crate::qp::{QpConfig, QpSolver, QpStatus};
+use crate::qp::{QpConfig, QpSolver, QpStatus, QpWorkspace};
 use crate::task::Task;
 
 /// Which hierarchical-QP strategy resolves the priority stack.
@@ -175,9 +175,99 @@ pub fn solve_warm(
         }
     }
 
+    solve_dispatch(levels, cfg, warm_anchor, n, None)
+}
+
+fn solve_dispatch(
+    levels: &[Task],
+    cfg: &SolveConfig,
+    warm_anchor: Option<&DVector<f64>>,
+    n: usize,
+    workspaces: Option<&mut [QpWorkspace]>,
+) -> Result<Solution, WbcError> {
     match cfg.strategy {
-        HqpStrategy::NullSpace => Ok(solve_null_space(levels, cfg, warm_anchor)),
-        HqpStrategy::ForceBudgetCascade => Ok(solve_force_budget(levels, cfg, n)),
+        HqpStrategy::NullSpace => Ok(solve_null_space(levels, cfg, warm_anchor, workspaces)),
+        HqpStrategy::ForceBudgetCascade => Ok(solve_force_budget(levels, cfg, n, workspaces)),
+    }
+}
+
+/// A persistent solver session: one [`QpWorkspace`] per priority level,
+/// so the active-set backend warm-starts each level's inner QP from the
+/// previous tick's solution and working set (the qpOASES online-active-
+/// set pattern carried through the whole hierarchy). With the Clarabel
+/// backend it behaves exactly like the free [`solve`] function.
+///
+/// Keep one `Solver` alive for the lifetime of a controller and call
+/// [`Solver::solve`] every tick:
+///
+/// ```
+/// # #[cfg(feature = "clarabel")] {
+/// use misa_wbc::{Solver, SolveConfig, Task};
+/// use nalgebra::{DMatrix, DVector};
+///
+/// let mut solver = Solver::new();
+/// let cfg = SolveConfig::default();
+/// let level = Task::equality(DMatrix::identity(2, 2), DVector::from_vec(vec![1.0, 2.0]));
+/// for _tick in 0..3 {
+///     let sol = solver.solve(&[level.clone()], &cfg).unwrap();
+///     assert!((sol.x[0] - 1.0).abs() < 1e-6);
+/// }
+/// # }
+/// ```
+///
+/// If the level structure changes between ticks (different level count
+/// or inner dimensions — e.g. a contact appears), the affected
+/// workspaces simply fall back to a cold start for that tick; no reset
+/// is required for correctness.
+#[derive(Debug, Default)]
+pub struct Solver {
+    workspaces: Vec<QpWorkspace>,
+    /// The previous tick's solution, fed back as the proximal anchor
+    /// when [`SolveConfig::prox_weight`] > 0.
+    anchor: Option<DVector<f64>>,
+}
+
+impl Solver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop all warm-start state — the next solve is fully cold.
+    pub fn reset(&mut self) {
+        self.workspaces.clear();
+        self.anchor = None;
+    }
+
+    /// [`solve`] with this session's warm-start state. The stored
+    /// solution anchor is used for the proximal term automatically when
+    /// `cfg.prox_weight > 0`.
+    pub fn solve(&mut self, levels: &[Task], cfg: &SolveConfig) -> Result<Solution, WbcError> {
+        if levels.is_empty() {
+            return Err(WbcError::NoLevels);
+        }
+        let n = levels
+            .iter()
+            .map(Task::n_decision)
+            .find(|&d| d > 0)
+            .unwrap_or(0);
+        for (i, t) in levels.iter().enumerate() {
+            let d = t.n_decision();
+            if d != 0 && d != n {
+                return Err(WbcError::DimMismatch { level: i, expected: n, found: d });
+            }
+        }
+        self.workspaces.resize_with(levels.len(), QpWorkspace::default);
+
+        let anchor = if cfg.prox_weight > 0.0 { self.anchor.clone() } else { None };
+        let sol = solve_dispatch(
+            levels,
+            cfg,
+            anchor.as_ref(),
+            n,
+            Some(&mut self.workspaces[..]),
+        )?;
+        self.anchor = Some(sol.warm_anchor.clone());
+        Ok(sol)
     }
 }
 
@@ -187,6 +277,7 @@ fn solve_null_space(
     levels: &[Task],
     cfg: &SolveConfig,
     warm_anchor: Option<&DVector<f64>>,
+    mut workspaces: Option<&mut [QpWorkspace]>,
 ) -> Solution {
     let qp_cfg = cfg.qp_cfg();
     let warm = WarmStart { x_prev: warm_anchor, prox_weight: cfg.prox_weight };
@@ -194,7 +285,8 @@ fn solve_null_space(
     let mut prev: Option<HoQp> = None;
     let mut degraded: Option<(usize, QpStatus)> = None;
     for (i, t) in levels.iter().enumerate() {
-        let hqp = HoQp::new_with_cfg(t.clone(), prev.as_ref(), &warm, &qp_cfg);
+        let ws_i = workspaces.as_deref_mut().map(|w| &mut w[i]);
+        let hqp = HoQp::new_with_cfg_ws(t.clone(), prev.as_ref(), &warm, &qp_cfg, ws_i);
         if degraded.is_none() && hqp.status() != QpStatus::Optimal {
             degraded = Some((i, hqp.status()));
         }
@@ -227,7 +319,12 @@ fn solve_null_space(
 /// mirroring GID's committed `JointForce`. On a level failure the
 /// increment is skipped (GID's use-last-force fallback) and the first
 /// failure is reported as [`SolveStatus::Degraded`].
-fn solve_force_budget(levels: &[Task], cfg: &SolveConfig, n: usize) -> Solution {
+fn solve_force_budget(
+    levels: &[Task],
+    cfg: &SolveConfig,
+    n: usize,
+    mut workspaces: Option<&mut [QpWorkspace]>,
+) -> Solution {
     use nalgebra::DMatrix;
 
     let qp_cfg = cfg.qp_cfg();
@@ -264,16 +361,30 @@ fn solve_force_budget(levels: &[Task], cfg: &SolveConfig, n: usize) -> Solution 
             .as_ref()
             .map(|f| f - stacked_d.as_ref().expect("d/f stacked together") * &x_c);
 
-        let sol = crate::qp::solve_qp(
-            &h,
-            &g,
-            None,
-            None,
-            stacked_d.as_ref(),
-            shifted_f.as_ref(),
-            None,
-            &qp_cfg,
-        );
+        let ws_k = workspaces.as_deref_mut().map(|w| &mut w[k]);
+        let sol = match ws_k {
+            Some(ws) => crate::qp::solve_qp_warm(
+                &h,
+                &g,
+                None,
+                None,
+                stacked_d.as_ref(),
+                shifted_f.as_ref(),
+                None,
+                &qp_cfg,
+                ws,
+            ),
+            None => crate::qp::solve_qp(
+                &h,
+                &g,
+                None,
+                None,
+                stacked_d.as_ref(),
+                shifted_f.as_ref(),
+                None,
+                &qp_cfg,
+            ),
+        };
         if sol.status == QpStatus::Optimal {
             x_c += &sol.x;
         } else if degraded.is_none() {
@@ -369,4 +480,42 @@ mod tests {
         let s2 = solve_warm(&levels(), &cfg, Some(&s1.warm_anchor)).unwrap();
         assert!((&s1.x - &s2.x).norm() < 1e-4);
     }
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn session_matches_stateless_and_stays_optimal() {
+        // ActiveSet backend + session: repeated ticks must stay optimal
+        // and agree with the stateless solve (and Clarabel).
+        let cfg = SolveConfig { backend: QpSolver::ActiveSet, ..Default::default() };
+        let mut solver = Solver::new();
+        let stateless = solve(&levels(), &SolveConfig::default()).unwrap();
+        for _tick in 0..5 {
+            let s = solver.solve(&levels(), &cfg).unwrap();
+            assert_eq!(s.status, SolveStatus::Optimal);
+            assert!((&s.x - &stateless.x).norm() < 1e-5, "session drifted");
+        }
+    }
+
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn session_survives_level_structure_changes() {
+        // Changing level count / dimensions between ticks must fall back
+        // to a cold start gracefully, not corrupt the result.
+        let cfg = SolveConfig::default();
+        let mut solver = Solver::new();
+        let _ = solver.solve(&levels(), &cfg).unwrap();
+
+        // Different structure: one level, three variables.
+        let other = vec![Task::equality(
+            DMatrix::from_row_slice(2, 3, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            DVector::from_vec(vec![3.0, 4.0]),
+        )];
+        let s = solver.solve(&other, &cfg).unwrap();
+        assert_eq!(s.status, SolveStatus::Optimal);
+        assert!((s.x[0] - 3.0).abs() < 1e-6 && (s.x[1] - 4.0).abs() < 1e-6);
+
+        // And back again.
+        let s = solver.solve(&levels(), &cfg).unwrap();
+        assert!((s.x[0] - 1.0).abs() < 1e-6 && (s.x[1] - 2.0).abs() < 1e-6);
+    }
+
 }

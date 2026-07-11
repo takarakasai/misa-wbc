@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use misa_wbc::qp::QpSolver;
 use misa_wbc::{
-    solve, tasks, Dynamics, Extracted, Formulation, HqpStrategy, SolveConfig, SolveStatus, Task,
+    tasks, Dynamics, Extracted, Formulation, HqpStrategy, SolveConfig, SolveStatus, Solver, Task,
 };
 use nalgebra::{DMatrix, DVector};
 
@@ -204,12 +204,16 @@ fn main() {
             for (backend, bname) in backends {
                 let cfg = SolveConfig { strategy, backend, ..Default::default() };
 
+                // One persistent session per combination — the realistic
+                // controller shape, and what lets the active-set backend
+                // warm-start across ticks.
+                let mut solver = Solver::new();
                 let mut times = Vec::with_capacity(RUNS);
                 let mut last = None;
                 let mut status_ok = true;
                 for run in 0..(WARMUP + RUNS) {
                     let t0 = Instant::now();
-                    let sol = solve(&levels, &cfg).expect("solve");
+                    let sol = solver.solve(&levels, &cfg).expect("solve");
                     let dt = t0.elapsed().as_secs_f64() * 1e3;
                     if run >= WARMUP {
                         times.push(dt);

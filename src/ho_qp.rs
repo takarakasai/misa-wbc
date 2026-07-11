@@ -30,7 +30,7 @@
 
 use nalgebra::{DMatrix, DVector};
 
-use crate::qp::{solve_qp, QpConfig, QpSolver, QpStatus};
+use crate::qp::{solve_qp, solve_qp_warm, QpConfig, QpSolver, QpStatus, QpWorkspace};
 
 use crate::task::Task;
 
@@ -150,6 +150,20 @@ impl HoQp {
         higher: Option<&HoQp>,
         warm: &WarmStart<'_>,
         qp_cfg: &QpConfig,
+    ) -> Self {
+        Self::new_with_cfg_ws(task, higher, warm, qp_cfg, None)
+    }
+
+    /// [`HoQp::new_with_cfg`] with an optional persistent [`QpWorkspace`]
+    /// for the inner QP — the hook a session-holding caller (see
+    /// [`crate::solve::Solver`]) uses to carry the active-set working
+    /// set across ticks. `None` reproduces the stateless behaviour.
+    pub fn new_with_cfg_ws(
+        task: Task,
+        higher: Option<&HoQp>,
+        warm: &WarmStart<'_>,
+        qp_cfg: &QpConfig,
+        workspace: Option<&mut QpWorkspace>,
     ) -> Self {
         let (n_decision_total, prev) = match higher {
             Some(h) => (h.state.x.len(), h.state.clone()),
@@ -303,16 +317,29 @@ impl HoQp {
         };
         let qp_a_iq = (m_total > 0).then(|| d_total.clone());
         let qp_b_iq = (m_total > 0).then(|| f_total.clone());
-        let sol = solve_qp(
-            &h,
-            &c,
-            None,
-            None,
-            qp_a_iq.as_ref(),
-            qp_b_iq.as_ref(),
-            warm_y_owned.as_ref(),
-            &cfg,
-        );
+        let sol = match workspace {
+            Some(ws) => solve_qp_warm(
+                &h,
+                &c,
+                None,
+                None,
+                qp_a_iq.as_ref(),
+                qp_b_iq.as_ref(),
+                warm_y_owned.as_ref(),
+                &cfg,
+                ws,
+            ),
+            None => solve_qp(
+                &h,
+                &c,
+                None,
+                None,
+                qp_a_iq.as_ref(),
+                qp_b_iq.as_ref(),
+                warm_y_owned.as_ref(),
+                &cfg,
+            ),
+        };
         if !matches!(sol.status, QpStatus::Optimal) {
             // The status also propagates to the returned solution, so a
             // host with a logging facade can surface it there. We keep

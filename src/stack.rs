@@ -45,7 +45,7 @@ use std::fmt;
 use nalgebra::DVector;
 
 use crate::affine::VarLayout;
-use crate::solve::{solve_warm, Solution, SolveConfig, SolveStatus, WbcError};
+use crate::solve::{solve_warm, Solution, SolveConfig, SolveStatus, Solver, WbcError};
 use crate::task::Task;
 
 /// One named task inside a level.
@@ -126,6 +126,13 @@ impl Stack {
     /// per named task.
     pub fn solve(&self, cfg: &SolveConfig) -> Result<StackSolution, WbcError> {
         self.solve_warm(cfg, None)
+    }
+
+    /// [`Stack::solve`] through a persistent [`Solver`] session, so the
+    /// active-set backend warm-starts across ticks.
+    pub fn solve_with(&self, solver: &mut Solver, cfg: &SolveConfig) -> Result<StackSolution, WbcError> {
+        let solution = solver.solve(&self.to_tasks(), cfg)?;
+        Ok(StackSolution { stack: self.clone(), solution })
     }
 
     /// [`Stack::solve`] with a warm anchor (see [`crate::solve::solve_warm`]).
