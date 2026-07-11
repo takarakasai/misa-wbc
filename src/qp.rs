@@ -171,20 +171,35 @@ impl Default for QpConfig {
 
 // ─── Warm-start workspace ───────────────────────────────────────────────────
 
-/// Reusable warm-start state for the [`QpSolver::ActiveSet`] backend —
-/// qpOASES's "online active set" idea, pragmatically: keep the previous
-/// solution and working set, and let the next (identical or gently
-/// perturbed) solve start from them instead of a cold Phase-1. For a
-/// repeated QP the re-solve converges in O(1) iterations; for a
-/// perturbed one the previous point is re-projected onto the new
-/// equality manifold and the working set re-seeded.
+/// Reusable warm-start state, shared across backends (each backend
+/// only touches the fields relevant to it):
+///
+/// - [`QpSolver::ActiveSet`] — qpOASES's "online active set" idea:
+///   keep the previous solution and working set, and let the next
+///   (identical or gently perturbed) solve start from them instead of
+///   a cold Phase-1. For a repeated QP the re-solve converges in O(1)
+///   iterations; for a perturbed one the previous point is
+///   re-projected onto the new equality manifold and the working set
+///   re-seeded.
+/// - [`QpSolver::Ipm`] / [`QpSolver::IpmMcc`] — the previous `(s, z)`
+///   seed the next solve's interior point instead of the fixed
+///   `s = z = 1` cold start (repaired to stay strictly positive after
+///   any perturbation — see the `Ipm`/`IpmMcc` warm-start notes below). This
+///   is inherently less dramatic than active-set's warm start: an IPM
+///   follows a central *path*, so reusing the previous optimum (which
+///   sits near the path's end, not at a generic interior point) mainly
+///   shortens how far the barrier parameter has to descend, not the
+///   combinatorial work active-set's working set reuse skips.
 ///
 /// Feed it to [`solve_qp_warm`]; every solve updates it in place.
-/// Ignored by the Clarabel backend (which is warm-start-free here).
+/// Ignored by the Clarabel and Admm backends here.
 #[derive(Clone, Debug, Default)]
 pub struct QpWorkspace {
     x: Option<DVector<f64>>,
     working_set: Vec<usize>,
+    ipm_s: Option<DVector<f64>>,
+    ipm_z: Option<DVector<f64>>,
+    ipm_y: Option<DVector<f64>>,
 }
 
 impl QpWorkspace {
@@ -196,6 +211,9 @@ impl QpWorkspace {
     pub fn clear(&mut self) {
         self.x = None;
         self.working_set.clear();
+        self.ipm_s = None;
+        self.ipm_z = None;
+        self.ipm_y = None;
     }
 }
 
@@ -288,12 +306,17 @@ fn solve_qp_impl(
     let h_eff: &DMatrix<f64> = h_owned.as_ref().unwrap_or(h);
     let c_eff: &DVector<f64> = c_owned.as_ref().unwrap_or(c);
 
+    let mut workspace = workspace;
     let mut sol = match config.solver {
         QpSolver::ActiveSet => {
-            solve_qp_active_set(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, x0, config, workspace)
+            solve_qp_active_set(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, x0, config, workspace.as_deref_mut())
         }
-        QpSolver::Ipm => solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config, false),
-        QpSolver::IpmMcc => solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config, true),
+        QpSolver::Ipm => {
+            solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config, false, workspace.as_deref_mut())
+        }
+        QpSolver::IpmMcc => {
+            solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config, true, workspace.as_deref_mut())
+        }
         QpSolver::Admm => solve_qp_admm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config),
         QpSolver::Clarabel => {
             #[cfg(feature = "clarabel")]
@@ -664,6 +687,23 @@ fn stash(w: Option<&mut QpWorkspace>, x: &DVector<f64>, ws: &[usize]) {
     if let Some(w) = w {
         w.x = Some(x.clone());
         w.working_set = ws.to_vec();
+    }
+}
+
+/// Store the IPM's exit state `(x, s, z, y)` into the caller's
+/// workspace (if any) for the next tick's warm start.
+fn stash_ipm(
+    w: Option<&mut QpWorkspace>,
+    x: &DVector<f64>,
+    s: &DVector<f64>,
+    z: &DVector<f64>,
+    y: &DVector<f64>,
+) {
+    if let Some(w) = w {
+        w.x = Some(x.clone());
+        w.ipm_s = Some(s.clone());
+        w.ipm_z = Some(z.clone());
+        w.ipm_y = Some(y.clone());
     }
 }
 
@@ -1345,6 +1385,7 @@ fn solve_qp_ipm(
     b_iq: Option<&DVector<f64>>,
     config: &QpConfig,
     mcc: bool,
+    mut workspace: Option<&mut QpWorkspace>,
 ) -> QpSolution {
     let n = h.nrows();
     assert_eq!(h.ncols(), n, "H must be square");
@@ -1358,14 +1399,38 @@ fn solve_qp_ipm(
     // Fraction-to-boundary safety margin (Wächter & Biegler / standard
     // IPM practice): never step all the way to the s/z boundary.
     const TAU: f64 = 0.995;
+    // Floor applied to any warm-started (s, z): the previous solve's
+    // optimum sits near the boundary (small s or z components ARE the
+    // active/tight constraints), so reusing it verbatim risks starting
+    // at, or past, zero. This is the IPM analogue of the active-set
+    // warm start's "repair the previous point back into the feasible
+    // set" step — except here there is no feasible region to project
+    // onto, just the positivity orthant, so a floor is the whole repair.
+    const WARM_FLOOR: f64 = 1e-3;
 
-    let mut x = DVector::<f64>::zeros(n);
-    // s, z start at a fixed strictly-feasible-in-sign point (a proper
-    // implementation would use Mehrotra's initialisation heuristic;
-    // this keeps the algorithm's structure legible).
-    let mut s = DVector::<f64>::repeat(m_iq, 1.0);
-    let mut z = DVector::<f64>::repeat(m_iq, 1.0);
-    let mut y = DVector::<f64>::zeros(m_eq);
+    // ── Warm start: reuse the previous (x, s, z, y) if shapes match ──
+    let (mut x, mut s, mut z, mut y) = match &workspace {
+        Some(w)
+            if w.x.as_ref().is_some_and(|v| v.len() == n)
+                && w.ipm_s.as_ref().is_some_and(|v| v.len() == m_iq)
+                && w.ipm_z.as_ref().is_some_and(|v| v.len() == m_iq)
+                && w.ipm_y.as_ref().is_some_and(|v| v.len() == m_eq) =>
+        {
+            let s0 = w.ipm_s.clone().unwrap().map(|v| v.max(WARM_FLOOR));
+            let z0 = w.ipm_z.clone().unwrap().map(|v| v.max(WARM_FLOOR));
+            (w.x.clone().unwrap(), s0, z0, w.ipm_y.clone().unwrap())
+        }
+        _ => (
+            DVector::<f64>::zeros(n),
+            // Cold s, z: a fixed strictly-feasible-in-sign point (a
+            // proper implementation would use Mehrotra's
+            // initialisation heuristic; this keeps the algorithm's
+            // structure legible).
+            DVector::<f64>::repeat(m_iq, 1.0),
+            DVector::<f64>::repeat(m_iq, 1.0),
+            DVector::<f64>::zeros(m_eq),
+        ),
+    };
 
     let mut iters = 0;
     for iter in 0..config.max_iters {
@@ -1384,6 +1449,7 @@ fn solve_qp_ipm(
             && r_iq.norm() < config.feasibility_tol * scale
             && mu < config.optimality_tol
         {
+            stash_ipm(workspace.as_deref_mut(), &x, &s, &z, &y);
             return make_sol(x, h, c, y, z, QpStatus::Optimal, iters);
         }
 
@@ -1391,6 +1457,7 @@ fn solve_qp_ipm(
             // No inequalities: one exact Newton step solves the (linear)
             // KKT system directly — no barrier, nothing to predict.
             let Some((dx, dy)) = solve_reduced_kkt(h, &ae, &(-&r_stat), &(-&r_eq)) else {
+                stash_ipm(workspace.as_deref_mut(), &x, &s, &z, &y);
                 return make_sol(x, h, c, y, z, QpStatus::NumericalFailure, iters);
             };
             x += dx;
@@ -1427,6 +1494,7 @@ fn solve_qp_ipm(
         let t_aff = DVector::from_fn(m_iq, |i, _| -(s[i] * z[i]));
         let Some((dx_aff, _dy_aff)) = solve_reduced_kkt(&h_bar, &ae, &rhs_x(&t_aff), &(-&r_eq))
         else {
+            stash_ipm(workspace.as_deref_mut(), &x, &s, &z, &y);
             return make_sol(x, h, c, y, z, QpStatus::NumericalFailure, iters);
         };
         let ds_aff = -&r_iq - &ai * &dx_aff;
@@ -1447,6 +1515,7 @@ fn solve_qp_ipm(
             -(s[i] * z[i]) + sigma_mu - ds_aff[i] * dz_aff[i]
         });
         let Some((dx, dy)) = solve_reduced_kkt(&h_bar, &ae, &rhs_x(&t_cor), &(-&r_eq)) else {
+            stash_ipm(workspace.as_deref_mut(), &x, &s, &z, &y);
             return make_sol(x, h, c, y, z, QpStatus::NumericalFailure, iters);
         };
         let mut dp_x = dx;
@@ -1541,6 +1610,7 @@ fn solve_qp_ipm(
         z += alpha_d * &dp_z;
     }
 
+    stash_ipm(workspace, &x, &s, &z, &y);
     make_sol(x, h, c, y, z, QpStatus::MaxIterations, iters)
 }
 
@@ -2584,6 +2654,61 @@ mod tests {
         let sol = solve_qp(&h, &c, Some(&a), Some(&b), None, None, None, &cfg);
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_eq!(sol.iterations, 2);
+    }
+
+    // ─── Ipm warm start (via QpWorkspace) ────────────────────────────
+
+    #[test]
+    fn ipm_warm_start_reduces_iterations_on_a_perturbed_tick_sequence() {
+        // A drifting QP sequence (b_eq and c move every tick) — warm
+        // restarts must stay correct (KKT) and use markedly fewer
+        // total iterations than cold-starting every tick, since the
+        // barrier only has to descend from near the previous
+        // solution's mu instead of from mu=1 every time.
+        let mut rng = Lcg(0xCAFE);
+        let (h, c0, ae, be0, ai, bi) = random_qp(&mut rng, 12, 3, 14);
+        let cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        let mut ws = QpWorkspace::new();
+        let mut warm_iters = 0usize;
+        let mut cold_iters = 0usize;
+
+        for t in 0..20 {
+            let phase = t as f64 * 0.15;
+            let c = &c0 + DVector::from_fn(c0.len(), |i, _| 0.01 * (phase + i as f64).sin());
+            let be = &be0 + DVector::from_fn(be0.len(), |i, _| 0.005 * (phase * 1.3 + i as f64).cos());
+
+            let warm =
+                solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+            assert_kkt(&h, &c, &ae, &be, &ai, &bi, &warm);
+            warm_iters += warm.iterations;
+
+            let cold = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            cold_iters += cold.iterations;
+            assert!((&warm.x - &cold.x).norm() < 1e-4, "tick {t}: warm and cold disagree");
+        }
+        assert!(
+            warm_iters < cold_iters,
+            "warm restarts should beat cold starts: {warm_iters} vs {cold_iters}"
+        );
+    }
+
+    #[test]
+    fn ipm_warm_start_survives_shape_changes() {
+        // If the problem's dimensions change between ticks (e.g. a
+        // contact appears), the stored (x, s, z, y) no longer match and
+        // the solver must fall back to a cold start rather than panic
+        // or silently misuse mismatched vectors.
+        let mut rng = Lcg(0xFEED);
+        let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 8, 2, 6);
+        let cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        let mut ws = QpWorkspace::new();
+        let _ = solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+
+        // Different shape: n=12, m_eq=4, m_iq=10.
+        let (h2, c2, ae2, be2, ai2, bi2) = random_qp(&mut rng, 12, 4, 10);
+        let sol =
+            solve_qp_warm(&h2, &c2, Some(&ae2), Some(&be2), Some(&ai2), Some(&bi2), None, &cfg, &mut ws);
+        assert_kkt(&h2, &c2, &ae2, &be2, &ai2, &bi2, &sol);
     }
 
     // ─── ADMM (operator splitting / OSQP algorithm) ──────────────────
