@@ -179,6 +179,7 @@ fn main() {
         (QpSolver::Clarabel, "Clarabel"),
         (QpSolver::ActiveSet, "ActiveSet"),
         (QpSolver::Ipm, "Ipm"),
+        (QpSolver::Admm, "Admm"),
     ];
 
     const WARMUP: usize = 5;
