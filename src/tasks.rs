@@ -22,6 +22,7 @@
 //! | [`patch_contact`] | GID SetContactSupport / OpenSoT CoP+WrenchLimits |
 //! | [`centroidal_momentum`] | GID Momentum unit / OpenSoT CoM+AngularMomentum |
 //! | [`box_bound`] | TorqueLimits / WrenchLimits (symmetric) |
+//! | [`joint_limit_cbf`] | OpenSoT constraints::acceleration::JointLimitsECBF |
 //!
 //! Decision-vector layout is the caller's: these builders only touch the
 //! variables passed in, so `x = [q̈; f; τ]` (τ explicit, the
@@ -216,6 +217,100 @@ pub fn centroidal_momentum(
     cartesian_acceleration(qddot, cmm, dcmm_v, h_rate_ref)
 }
 
+/// Per-joint gains and limits for [`joint_limit_cbf`] — the exponential
+/// control barrier function (ECBF) joint-limit constraint (Khazoom,
+/// Gonzalez-Diaz, Ding & Kim, *Humanoid Self-Collision Avoidance Using
+/// Whole-Body Control with Control Barrier Functions*; OpenSoT's
+/// `JointLimitsECBF`).
+///
+/// All fields are per-DOF vectors (length = number of joints this
+/// applies to); pass `DVector::from_element(n, v)` for a uniform gain.
+#[derive(Clone, Debug)]
+pub struct JointLimitCbf {
+    /// Lower position limit `q_min`.
+    pub q_min: DVector<f64>,
+    /// Upper position limit `q_max`.
+    pub q_max: DVector<f64>,
+    /// Velocity magnitude limit `|q̇| ≤ v_max`.
+    pub v_max: DVector<f64>,
+    /// Acceleration magnitude limit `|q̈| ≤ a_max` — the final clamp,
+    /// always respected regardless of how the barriers evaluate.
+    pub a_max: DVector<f64>,
+    /// Position-barrier gain (rad/s, roughly "how many seconds before
+    /// the limit does braking start").
+    pub alpha1: DVector<f64>,
+    /// Second position-barrier gain — `alpha1`/`alpha2` are the two
+    /// poles of the 2nd-order barrier's characteristic polynomial
+    /// `s² + (α1+α2)s + α1·α2`; equal gains give a critically-damped
+    /// approach to the limit.
+    pub alpha2: DVector<f64>,
+    /// Velocity-barrier gain (1st-order: how aggressively `q̈` brakes
+    /// as `q̇` approaches `±v_max`).
+    pub alpha3: DVector<f64>,
+}
+
+/// Joint position/velocity limits as an acceleration-level **control
+/// barrier function** — the standing OpenSoT gap `ref/wbc_comparison.md`
+/// flagged (D6): a *safety* constraint (never let the joint reach its
+/// limit) rather than a *tracking* task, expressed as a state-dependent
+/// box on `q̈`.
+///
+/// For each DOF, two second-order barriers (`h = q_max − q` and
+/// `h = q − q_min`, relative degree 2 since `q̈` appears two
+/// derivatives down) each demand `ḧ + (α1+α2)ḣ + α1·α2·h ≥ 0` — the
+/// standard exponential-CBF condition, equivalent to placing both
+/// poles of the barrier's response at `−α1` and `−α2` — which resolves
+/// to a bound on `q̈`:
+///
+/// ```text
+///   q̈ ≤ −(α1+α2)·q̇ + α1·α2·(q_max − q)   (upper barrier)
+///   q̈ ≥ −(α1+α2)·q̇ + α1·α2·(q_min − q)   (lower barrier)
+/// ```
+///
+/// intersected with a first-order velocity-limit barrier
+/// (`q̈ ≤ α3·(v_max − q̇)`, `q̈ ≥ α3·(−v_max − q̇)`) and the hard
+/// `[−a_max, a_max]` box. If the barriers' intersection is empty at
+/// the current `(q, q̇)` (already past a limit, or moving fast enough
+/// that the gains can't arrest it in time — a modelling infeasibility,
+/// not a bug), the bounds are swapped rather than left empty so the
+/// task always has a Task::in_range interval to hand the solver; that
+/// tick's HoQp slack absorbs the rest (see the `Task::inequality`
+/// slack-relaxation contract this crate already relies on elsewhere).
+///
+/// `q`, `q̇` are this DOF group's current position/velocity (already
+/// sliced to match `limits`'s length and `qddot`'s output dimension).
+pub fn joint_limit_cbf(qddot: &impl AsAffine, q: &DVector<f64>, v: &DVector<f64>, limits: &JointLimitCbf) -> Task {
+    let n = q.len();
+    assert_eq!(qddot.out_size(), n, "joint_limit_cbf: qddot size must match q");
+    assert_eq!(v.len(), n, "joint_limit_cbf: v size must match q");
+    for (name, field) in [
+        ("q_min", &limits.q_min), ("q_max", &limits.q_max), ("v_max", &limits.v_max),
+        ("a_max", &limits.a_max), ("alpha1", &limits.alpha1), ("alpha2", &limits.alpha2),
+        ("alpha3", &limits.alpha3),
+    ] {
+        assert_eq!(field.len(), n, "joint_limit_cbf: {name} length must match q");
+    }
+
+    let mut lb = DVector::zeros(n);
+    let mut ub = DVector::zeros(n);
+    for i in 0..n {
+        let (a1, a2, a3) = (limits.alpha1[i], limits.alpha2[i], limits.alpha3[i]);
+        let damping = -(a1 + a2) * v[i];
+        let upper_ecbf = damping + a1 * a2 * (limits.q_max[i] - q[i]);
+        let lower_ecbf = damping + a1 * a2 * (limits.q_min[i] - q[i]);
+
+        let mut u = upper_ecbf.min(a3 * (limits.v_max[i] - v[i])).min(limits.a_max[i]);
+        let mut l = lower_ecbf.max(a3 * (-limits.v_max[i] - v[i])).max(-limits.a_max[i]);
+        if u < l {
+            std::mem::swap(&mut u, &mut l);
+        }
+        ub[i] = u.min(limits.a_max[i]);
+        lb[i] = l.max(-limits.a_max[i]);
+    }
+
+    Task::in_range(&lb, &qddot.as_affine(), &ub)
+}
+
 /// Parameters of a rectangular **surface (patch) contact** — the full
 /// GID `SetContactSupport` set: Coulomb friction, centre-of-pressure
 /// (CoP/ZMP) box, torsional friction and unilaterality, all coupled to
@@ -338,6 +433,103 @@ mod tests {
         assert_eq!(t.n_eq(), 1);
         let x = DVector::from_vec(vec![1.5, 9.9]);
         assert!((&t.a * &x - &t.b).norm() < 1e-12);
+    }
+
+    fn uniform_cbf(n: usize, q_min: f64, q_max: f64, v_max: f64, a_max: f64, a1: f64, a2: f64, a3: f64) -> JointLimitCbf {
+        JointLimitCbf {
+            q_min: DVector::from_element(n, q_min),
+            q_max: DVector::from_element(n, q_max),
+            v_max: DVector::from_element(n, v_max),
+            a_max: DVector::from_element(n, a_max),
+            alpha1: DVector::from_element(n, a1),
+            alpha2: DVector::from_element(n, a2),
+            alpha3: DVector::from_element(n, a3),
+        }
+    }
+
+    #[test]
+    fn joint_limit_cbf_is_loose_far_from_any_limit() {
+        // At the neutral midpoint, at rest, well inside every limit: the
+        // barrier bounds should reduce to (close to) the plain a_max box —
+        // the CBF must not needlessly restrict a safe state.
+        let l = layout(2, 0, 0);
+        let q = l.var("qddot");
+        // v_max=10 kept loose (well above what a_max would ever demand)
+        // so the a_max clamp — not the velocity barrier — is what's
+        // actually being tested here.
+        let limits = uniform_cbf(2, -1.0, 1.0, 10.0, 10.0, 4.0, 4.0, 4.0);
+        let pos = DVector::from_element(2, 0.0); // midpoint
+        let vel = DVector::zeros(2);
+        let t = joint_limit_cbf(&q, &pos, &vel, &limits);
+        assert_eq!(t.n_iq(), 4); // in_range = le + ge, 2 rows each
+
+        // q̈ = 0 must be feasible (well inside a loose barrier).
+        let x = DVector::zeros(2);
+        let margin = &t.f - &t.d * &x;
+        for i in 0..4 {
+            assert!(margin[i] >= 0.0, "row {i} margin {}", margin[i]);
+        }
+        // Position-ECBF bound is a1·a2·(q_max-q) = 16, clamped to
+        // a_max=10 — i.e. the hard box, not a tighter one.
+        // (upper bound row: coefficient +1 on qddot, rhs = ub)
+        let ub_row0 = t.f[0]; // le rows come first in Task::in_range
+        assert!((ub_row0 - 10.0).abs() < 1e-9, "expected a_max clamp, got {ub_row0}");
+    }
+
+    #[test]
+    fn joint_limit_cbf_brakes_hard_near_the_upper_limit() {
+        // Close to q_max and still moving toward it: the upper bound on
+        // q̈ must go negative (demand braking), not just "less positive".
+        let l = layout(1, 0, 0);
+        let q = l.var("qddot");
+        let limits = uniform_cbf(1, -1.0, 1.0, 2.0, 10.0, 4.0, 4.0, 4.0);
+        let pos = DVector::from_vec(vec![0.99]); // 1cm from q_max=1.0
+        let vel = DVector::from_vec(vec![1.5]); // moving toward the limit
+        let t = joint_limit_cbf(&q, &pos, &vel, &limits);
+
+        // Upper barrier: -(a1+a2)v + a1a2(qmax-q) = -8*1.5 + 16*0.01 = -11.84,
+        // clamped to a_max: still deeply negative → braking is mandatory.
+        let ub = t.f[0];
+        assert!(ub < 0.0, "expected mandatory braking (ub<0), got {ub}");
+    }
+
+    #[test]
+    fn joint_limit_cbf_respects_velocity_limit_even_mid_range() {
+        // Position is safe, but velocity is already at v_max: the
+        // 1st-order velocity barrier must cap q̈ at ~0 (can't accelerate
+        // further in that direction) even though the position barrier
+        // alone would allow it.
+        let l = layout(1, 0, 0);
+        let q = l.var("qddot");
+        let limits = uniform_cbf(1, -10.0, 10.0, 2.0, 10.0, 1.0, 1.0, 4.0);
+        let pos = DVector::from_vec(vec![0.0]); // midpoint, position barrier is loose
+        let vel = DVector::from_vec(vec![2.0]); // already at v_max
+        let t = joint_limit_cbf(&q, &pos, &vel, &limits);
+
+        // Velocity barrier: alpha3*(v_max - v) = 4*(2-2) = 0.
+        let ub = t.f[0];
+        assert!(ub <= 1e-9, "velocity-at-limit should cap qddot near 0, got {ub}");
+    }
+
+    #[test]
+    fn joint_limit_cbf_swaps_bounds_when_already_infeasible_rather_than_panicking() {
+        // Position already past q_max: the raw upper/lower barrier
+        // evaluation can cross (upper < lower). The function must not
+        // panic or emit an empty/invalid Task — it swaps so in_range
+        // still has a valid interval (the modelling infeasibility is
+        // then absorbed by the solver's slack, not this function).
+        let l = layout(1, 0, 0);
+        let q = l.var("qddot");
+        let limits = uniform_cbf(1, -1.0, 1.0, 2.0, 10.0, 4.0, 4.0, 4.0);
+        let pos = DVector::from_vec(vec![1.5]); // already past q_max=1.0
+        let vel = DVector::from_vec(vec![3.0]); // moving further out
+        let t = joint_limit_cbf(&q, &pos, &vel, &limits);
+        // Merely reaching here without panicking is already the primary
+        // assertion. Beyond that: `in_range`'s le/ge pair (row 0 = ub,
+        // row 1 encodes lb as `q ≥ lb` ⇒ f[1] = -lb) must describe a
+        // non-empty interval, not one the swap left inverted.
+        let (ub, lb) = (t.f[0], -t.f[1]);
+        assert!(lb <= ub + 1e-9, "swapped interval should be non-empty: lb={lb} ub={ub}");
     }
 
     #[test]
