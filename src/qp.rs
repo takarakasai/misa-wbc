@@ -1100,23 +1100,36 @@ fn make_sol(
 /// ```
 ///
 /// The `x̃` step is one linear solve against
-/// `M = H + σ·I + ρ·Aᵀ·A` — **the same matrix every iteration** (`σ`,
-/// `ρ` are fixed), so `M` is Cholesky-factorised **once** before the
-/// loop; every iteration is a back-substitution, not a re-
-/// factorisation (unlike [`solve_qp_ipm`]) or an incremental update
-/// (unlike [`solve_qp_active_set`]) — a third way to make repeated
-/// solves cheap, no working-set or barrier bookkeeping at all. This is
-/// the standard OSQP "reduced KKT" derivation: eliminating the dual
-/// variable of the linear system's second row from
-/// `[H+σI Aᵀ; A −ρ⁻¹I]·[x̃;ν] = [σxᵏ−c; zᵏ−yᵏ/ρ]` gives
+/// `M = H + σ·I + ρ·Aᵀ·A`. For **fixed** `σ, ρ` this matrix never
+/// changes, so it would be Cholesky-factorised **once** and every
+/// iteration would be a back-substitution — no re-factorisation
+/// (unlike [`solve_qp_ipm`]) or incremental update (unlike
+/// [`solve_qp_active_set`]) at all. This implementation adds OSQP's
+/// **adaptive ρ retuning** (§5.2 of the paper) on top of that base
+/// case: `M` is re-factorised only when the primal/dual residual
+/// balance drifts outside a `[0.2, 5]×` band (checked every
+/// [`RHO_CHECK_EVERY`] iterations, since a factorisation is the
+/// expensive step), so most iterations are still cheap
+/// back-substitutions against a fixed `M` — the retuning is
+/// deliberately infrequent, not a return to per-iteration
+/// re-factorisation. This is the standard OSQP "reduced KKT"
+/// derivation: eliminating the dual variable of the linear system's
+/// second row from `[H+σI Aᵀ; A −ρ⁻¹I]·[x̃;ν] = [σxᵏ−c; zᵏ−yᵏ/ρ]` gives
 /// `M·x̃ = σxᵏ − c + Aᵀ(ρzᵏ − yᵏ)`.
 ///
 /// `σ = 1e-6` (a light Tikhonov term the OSQP paper uses for
 /// numerical stability / strong convexity) and `α = 1.6`
 /// (over-relaxation factor from the paper's recommended default) are
-/// fixed constants — this implementation does not include OSQP's
-/// adaptive `ρ` retuning (which would require re-factorising `M` when
-/// `ρ` changes), keeping the algorithm's structure legible.
+/// fixed constants throughout, as in the paper — only `ρ` adapts.
+/// `ρ`'s update rule is `ρ ← ρ·√[(r_prim/scale_p)/(r_dual/scale_d)]`,
+/// clamped to `[1e-6, 1e6]`: grow `ρ` when the primal (feasibility)
+/// residual dominates, shrink it when the dual (optimality) residual
+/// dominates. This is exactly the fixed-`σ`-mixed-task-weight
+/// pathology measured without retuning (see the module-level
+/// benchmark notes in `ref/wbc_comparison.md` — a fixed `ρ=10` needed
+/// ~2000 iterations/tick on the Go2-scale WBC problem); retuning
+/// exists specifically to correct a badly-guessed initial `ρ` without
+/// paying for re-factorisation on every single iteration.
 ///
 /// **Trade-off inherent to ADMM, not this implementation**: the cheap,
 /// factorisation-free iterations come at the cost of only *linear*
@@ -1151,8 +1164,18 @@ fn solve_qp_admm(
     let m = m_eq + m_iq;
 
     const SIGMA: f64 = 1e-6;
-    const RHO: f64 = 10.0;
+    const RHO_INIT: f64 = 10.0;
+    const RHO_MIN: f64 = 1e-6;
+    const RHO_MAX: f64 = 1e6;
     const ALPHA: f64 = 1.6;
+    // How far the residual-balance ratio must move before ρ is worth
+    // retuning (OSQP §5.2): retuning means re-factorising `M`, so it
+    // only pays off when the imbalance is large.
+    const RHO_RETUNE_BAND: (f64, f64) = (0.2, 5.0);
+    // Check every few iterations, not every one — factorisation is the
+    // expensive part, so amortise the residual-ratio check over a
+    // handful of cheap back-substitution iterations.
+    const RHO_CHECK_EVERY: usize = 3;
 
     if m == 0 {
         // No constraints at all: x = -H⁻¹c directly.
@@ -1178,13 +1201,17 @@ fn solve_qp_admm(
     }
     u.rows_mut(m_eq, m_iq).copy_from(&bi);
 
-    // M = H + σI + ρ·AᵀA, factorised once.
-    let m_mat = h + DMatrix::identity(n, n) * SIGMA + RHO * a.transpose() * &a;
-    let chol = match m_mat.cholesky() {
+    let a_t = a.transpose();
+    let ata = &a_t * &a; // ρ·AᵀA is rebuilt as a scalar multiple of this cached product.
+    let factorise = |rho: f64| -> Option<Cholesky<f64, Dyn>> {
+        (h + DMatrix::identity(n, n) * SIGMA + rho * &ata).cholesky()
+    };
+
+    let mut rho = RHO_INIT;
+    let mut chol = match factorise(rho) {
         Some(chol) => chol,
         None => return fail(n, m_eq, m_iq, QpStatus::NumericalFailure),
     };
-    let a_t = a.transpose();
 
     let mut x = DVector::<f64>::zeros(n);
     let mut z = DVector::<f64>::zeros(m);
@@ -1194,14 +1221,14 @@ fn solve_qp_admm(
     for iter in 0..config.max_iters {
         iters = iter + 1;
 
-        let rhs = &(SIGMA * &x - c) + &a_t * &(RHO * &z - &y);
+        let rhs = &(SIGMA * &x - c) + &a_t * &(rho * &z - &y);
         let x_tilde = chol.solve(&rhs);
         let z_tilde = &a * &x_tilde;
 
         let x_new = ALPHA * &x_tilde + (1.0 - ALPHA) * &x;
         let z_relaxed = ALPHA * &z_tilde + (1.0 - ALPHA) * &z;
-        let z_new = DVector::from_fn(m, |i, _| (z_relaxed[i] + y[i] / RHO).clamp(l[i], u[i]));
-        let y_new = &y + RHO * (&z_relaxed - &z_new);
+        let z_new = DVector::from_fn(m, |i, _| (z_relaxed[i] + y[i] / rho).clamp(l[i], u[i]));
+        let y_new = &y + rho * (&z_relaxed - &z_new);
 
         // ── Convergence check (OSQP's primal/dual residual test) ──
         let r_prim = &a * &x_new - &z_new;
@@ -1224,6 +1251,29 @@ fn solve_qp_admm(
                 QpStatus::Optimal,
                 iters,
             );
+        }
+
+        // ── Adaptive ρ retuning (OSQP §5.2) ────────────────────────
+        // ρ_new = ρ·√[(r_prim/scale_p) / (r_dual/scale_d)]: grow ρ
+        // when the primal residual dominates (push harder toward
+        // feasibility), shrink it when the dual residual dominates
+        // (push harder toward optimality). Only retune periodically
+        // and only outside a tolerance band around 1×, since it costs
+        // a full re-factorisation of `M`.
+        if (iter + 1) % RHO_CHECK_EVERY == 0 {
+            let num = r_prim.amax() / scale_p;
+            let den = (r_dual.amax() / scale_d).max(1e-300);
+            let ratio = (num / den).sqrt();
+            if !(RHO_RETUNE_BAND.0..=RHO_RETUNE_BAND.1).contains(&ratio) {
+                let rho_new = (rho * ratio).clamp(RHO_MIN, RHO_MAX);
+                if let Some(new_chol) = factorise(rho_new) {
+                    rho = rho_new;
+                    chol = new_chol;
+                }
+                // If re-factorisation fails (shouldn't, since H is
+                // PSD-safe and ρ>0), keep the current ρ/chol and carry
+                // on rather than aborting a solve that was progressing.
+            }
         }
     }
 
@@ -2456,12 +2506,11 @@ mod tests {
     }
 
     #[test]
-    fn admm_reports_max_iterations_without_diverging() {
-        // Documents the ADMM/IPM trade-off: at the crate default
-        // max_iters (500), a full-rank 10-var / 20-row random QP that
-        // active-set solves in a handful of steps doesn't reach ADMM's
-        // tight default optimality_tol — but the iterate stays close
-        // to the true optimum (graceful degradation, not divergence).
+    fn admm_adaptive_rho_converges_at_default_max_iters() {
+        // The exact problem that needed ~770 fixed-ρ iterations (see
+        // solve_qp_admm's docs) and used to exceed the crate default
+        // max_iters=500 — with adaptive ρ retuning it reaches Optimal
+        // well inside the default budget, and agrees with active-set.
         let mut rng = Lcg(0xFACADE);
         let n = 10;
         let a = DMatrix::from_fn(n, n, |_, _| rng.next_f64());
@@ -2472,15 +2521,70 @@ mod tests {
 
         let cfg = QpConfig { solver: QpSolver::Admm, ..Default::default() };
         let admm = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
-        assert_eq!(admm.status, QpStatus::MaxIterations);
+        assert_eq!(admm.status, QpStatus::Optimal, "adaptive ρ should converge in-budget");
 
         let as_cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
         let act = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &as_cfg);
         assert!(
             (&admm.x - &act.x).norm() < 1e-4,
-            "MaxIterations iterate should still be close to the true optimum: {}",
+            "admm/active-set disagree: {}",
             (&admm.x - &act.x).norm()
         );
+    }
+
+    #[test]
+    fn admm_reports_max_iterations_without_diverging() {
+        // A genuinely tiny iteration budget must still report
+        // MaxIterations honestly (not silently return an unconverged
+        // x as Optimal), while the iterate stays in the right
+        // neighbourhood rather than blowing up — ADMM degrades
+        // gracefully even when cut off early.
+        let mut rng = Lcg(0xFACADE);
+        let n = 10;
+        let a = DMatrix::from_fn(n, n, |_, _| rng.next_f64());
+        let h = a.transpose() * &a + DMatrix::identity(n, n) * 0.5;
+        let c = DVector::from_fn(n, |_, _| rng.next_f64());
+        let d = DMatrix::from_fn(2 * n, n, |_, _| rng.next_f64());
+        let f = DVector::from_fn(2 * n, |_, _| rng.next_f64().abs() * 0.5 + 0.1);
+
+        let cfg = QpConfig { solver: QpSolver::Admm, max_iters: 5, ..Default::default() };
+        let admm = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
+        assert_eq!(admm.status, QpStatus::MaxIterations);
+        assert!(admm.x.iter().all(|v| v.is_finite()), "iterate must not blow up: {:?}", admm.x);
+
+        let as_cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let act = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &as_cfg);
+        assert!(
+            (&admm.x - &act.x).norm() < 5.0,
+            "even a 5-iteration ADMM run should be in the right neighbourhood: {}",
+            (&admm.x - &act.x).norm()
+        );
+    }
+
+    #[test]
+    fn admm_adaptive_rho_speeds_up_the_ill_scaled_wbc_problem() {
+        // The Go2-scale, mixed-weight problem that needed ~2000 fixed-ρ
+        // iterations/tick (measured in qp_warm_bench without adaptive
+        // ρ) must now converge well inside the crate default max_iters
+        // (500) thanks to retuning away from the badly-guessed ρ=10.
+        let n = 42;
+        let weights = [1.0_f64, 0.1, 1e-3];
+        let mut h = DMatrix::<f64>::identity(n, n) * 1e-8;
+        let mut c = DVector::zeros(n);
+        for (k, &w) in weights.iter().enumerate() {
+            let rows = 6 + k * 3;
+            let a = DMatrix::from_fn(rows, n, |i, j| ((i * (7 + k) + j * (3 + k)) as f64 * 0.31).sin());
+            let b = DVector::from_fn(rows, |i, _| ((i as f64) * 0.8).cos() * 100.0);
+            h += w * a.transpose() * &a;
+            c -= w * a.transpose() * &b;
+        }
+        let d = DMatrix::from_fn(44, n, |i, j| ((i * 5 + j * 3) as f64 * 0.23).cos());
+        let f = DVector::from_fn(44, |i, _| 0.5 + 0.1 * ((i as f64) * 0.7).sin().abs());
+
+        let cfg = QpConfig { solver: QpSolver::Admm, ..Default::default() };
+        let sol = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
+        assert_eq!(sol.status, QpStatus::Optimal, "adaptive ρ should tame the ill-scaled problem");
+        assert!(sol.iterations < 500, "took {} iterations", sol.iterations);
     }
 
 }
