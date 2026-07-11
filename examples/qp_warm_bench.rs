@@ -195,7 +195,16 @@ fn main() {
     let ipm_mcc_cfg = QpConfig { solver: QpSolver::IpmMcc, ..Default::default() };
     let admm_cfg = QpConfig { solver: QpSolver::Admm, ..Default::default() };
 
-    for mode in ["ActiveSet cold", "ActiveSet warm", "Ipm", "Ipm warm", "IpmMcc", "Admm", "Clarabel"] {
+    for mode in [
+        "ActiveSet cold",
+        "ActiveSet warm",
+        "Ipm",
+        "Ipm warm",
+        "IpmMcc",
+        "IpmMcc warm",
+        "Admm",
+        "Clarabel",
+    ] {
         let mut ws = QpWorkspace::new();
         let mut times = Vec::with_capacity(TICKS);
         let mut iters = 0usize;
@@ -218,6 +227,9 @@ fn main() {
                     solve_qp_warm(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &ipm_cfg, &mut ws)
                 }
                 "IpmMcc" => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &ipm_mcc_cfg),
+                "IpmMcc warm" => solve_qp_warm(
+                    &p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &ipm_mcc_cfg, &mut ws,
+                ),
                 "Admm" => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &admm_cfg),
                 _ => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &cl_cfg),
             };
