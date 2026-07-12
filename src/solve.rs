@@ -219,7 +219,7 @@ fn solve_dispatch(
 /// or inner dimensions — e.g. a contact appears), the affected
 /// workspaces simply fall back to a cold start for that tick; no reset
 /// is required for correctness.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Solver {
     workspaces: Vec<QpWorkspace>,
     /// The previous tick's solution, fed back as the proximal anchor
