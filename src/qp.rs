@@ -55,6 +55,14 @@ pub enum QpSolver {
     /// Clarabel interior-point conic solver.
     /// Requires the `clarabel` Cargo feature.
     Clarabel,
+    /// Built-in primal-dual interior-point method (Mehrotra predictor-
+    /// corrector), dense, no external dependencies. A from-scratch,
+    /// textbook implementation — pedagogical / comparison counterpart
+    /// to [`ActiveSet`](QpSolver::ActiveSet) and
+    /// [`Clarabel`](QpSolver::Clarabel), which is *also* an interior-
+    /// point method but a mature conic one; this variant exists to
+    /// study the IPM approach itself, not to outperform Clarabel.
+    Ipm,
 }
 
 // ─── Public types ───────────────────────────────────────────────────────────
@@ -256,6 +264,7 @@ fn solve_qp_impl(
         QpSolver::ActiveSet => {
             solve_qp_active_set(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, x0, config, workspace)
         }
+        QpSolver::Ipm => solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config),
         QpSolver::Clarabel => {
             #[cfg(feature = "clarabel")]
             {
@@ -1054,6 +1063,220 @@ fn make_sol(
         status,
         iterations: iters,
     }
+}
+
+// ─── Interior-point backend (Mehrotra predictor-corrector) ──────────────────
+
+/// Built-in dense primal-dual interior-point QP solver.
+///
+/// A from-scratch implementation of Mehrotra's predictor-corrector
+/// method (Nocedal & Wright, *Numerical Optimization*, Algorithm 16.4)
+/// — the textbook path-following IPM, kept deliberately simple (dense
+/// linear algebra, no Mehrotra multiple-correction refinements beyond
+/// the standard predictor+corrector pair) since its purpose is to make
+/// the IPM approach concretely comparable to the active-set method in
+/// this same module, not to match Clarabel's maturity.
+///
+/// Standard form: introduce a slack `s ≥ 0` for the inequalities,
+/// `A_iq·x + s = b_iq`, and multipliers `y` (equalities), `z ≥ 0`
+/// (inequalities). The KKT system, perturbed by a barrier parameter
+/// `μ = sᵀz / m_iq`:
+///
+/// ```text
+///   H·x + c + A_eqᵀ·y + A_iqᵀ·z = 0        (stationarity)
+///   A_eq·x = b_eq                          (equality feasibility)
+///   A_iq·x + s = b_iq                      (inequality feasibility)
+///   S·z = μ·e                              (perturbed complementarity)
+/// ```
+///
+/// Each iteration takes an **affine** (μ = 0, predictor) Newton step to
+/// estimate how much duality gap reduction is achievable, derives
+/// Mehrotra's centering parameter `σ = (μ_aff/μ)³` from it, then solves
+/// once more with a **corrector** right-hand side (centering term +
+/// the affine step's second-order `Δs_aff∘Δz_aff` correction). Both
+/// solves reuse the same factorisation (only the RHS differs). Step
+/// lengths use the standard `τ = 0.995` fraction-to-boundary rule so
+/// `s, z` stay strictly positive.
+fn solve_qp_ipm(
+    h: &DMatrix<f64>,
+    c: &DVector<f64>,
+    a_eq: Option<&DMatrix<f64>>,
+    b_eq: Option<&DVector<f64>>,
+    a_iq: Option<&DMatrix<f64>>,
+    b_iq: Option<&DVector<f64>>,
+    config: &QpConfig,
+) -> QpSolution {
+    let n = h.nrows();
+    assert_eq!(h.ncols(), n, "H must be square");
+    assert_eq!(c.nrows(), n, "c length must match H dimension");
+
+    let (ae, be) = unpack_pair(a_eq, b_eq, n, "a_eq / b_eq");
+    let (ai, bi) = unpack_pair(a_iq, b_iq, n, "a_iq / b_iq");
+    let m_eq = ae.nrows();
+    let m_iq = ai.nrows();
+
+    // Fraction-to-boundary safety margin (Wächter & Biegler / standard
+    // IPM practice): never step all the way to the s/z boundary.
+    const TAU: f64 = 0.995;
+
+    let mut x = DVector::<f64>::zeros(n);
+    // s, z start at a fixed strictly-feasible-in-sign point (a proper
+    // implementation would use Mehrotra's initialisation heuristic;
+    // this keeps the algorithm's structure legible).
+    let mut s = DVector::<f64>::repeat(m_iq, 1.0);
+    let mut z = DVector::<f64>::repeat(m_iq, 1.0);
+    let mut y = DVector::<f64>::zeros(m_eq);
+
+    let mut iters = 0;
+    for iter in 0..config.max_iters {
+        iters = iter + 1;
+
+        // ── Residuals at the current point ────────────────────────
+        let r_stat = h * &x + c + ae.transpose() * &y + ai.transpose() * &z;
+        let r_eq = if m_eq > 0 { &ae * &x - &be } else { DVector::zeros(0) };
+        let r_iq = if m_iq > 0 { &ai * &x + &s - &bi } else { DVector::zeros(0) };
+        let mu = if m_iq > 0 { s.dot(&z) / m_iq as f64 } else { 0.0 };
+
+        // ── Convergence check ─────────────────────────────────────
+        let scale = 1.0 + c.norm();
+        if r_stat.norm() < config.optimality_tol * scale
+            && r_eq.norm() < config.feasibility_tol * scale
+            && r_iq.norm() < config.feasibility_tol * scale
+            && mu < config.optimality_tol
+        {
+            return make_sol(x, h, c, y, z, QpStatus::Optimal, iters);
+        }
+
+        if m_iq == 0 {
+            // No inequalities: one exact Newton step solves the (linear)
+            // KKT system directly — no barrier, nothing to predict.
+            let Some((dx, dy)) = solve_reduced_kkt(h, &ae, &(-&r_stat), &(-&r_eq)) else {
+                return make_sol(x, h, c, y, z, QpStatus::NumericalFailure, iters);
+            };
+            x += dx;
+            y += dy;
+            continue;
+        }
+
+        // ── Shared machinery for both the predictor and corrector solves ──
+        //
+        // Eliminating (ds, dz) from the linearised complementarity
+        // equation `Z·ds + S·dz = t` (t is the perturbed-complementarity
+        // target — different for the affine vs corrector step) against
+        // the inequality-feasibility equation `A_iq·dx + ds = -r_iq`
+        // gives:
+        //
+        //   dz = t/s − (z/s)·ds                              (dz_from)
+        //   [H + A_iqᵀ(Z/S)A_iq]·dx + A_eqᵀ·dy
+        //       = −r_stat − A_iqᵀ·[(z/s)·r_iq + t/s]          (rhs_x)
+        //
+        // (both derived by substituting dz into the stationarity
+        // equation `H·dx + A_eqᵀ·dy + A_iqᵀ·dz = −r_stat`).
+        let z_over_s = DVector::from_fn(m_iq, |i, _| z[i] / s[i]);
+        let h_bar = h + weighted_normal_eq(&ai, &z_over_s);
+        let rhs_x = |t: &DVector<f64>| -> DVector<f64> {
+            &(-&r_stat)
+                - ai.transpose()
+                    * DVector::from_fn(m_iq, |i, _| z_over_s[i] * r_iq[i] + t[i] / s[i])
+        };
+        let dz_from = |t: &DVector<f64>, ds: &DVector<f64>| -> DVector<f64> {
+            DVector::from_fn(m_iq, |i, _| t[i] / s[i] - z_over_s[i] * ds[i])
+        };
+
+        // ── Predictor (affine-scaling): drive complementarity to 0 ────
+        let t_aff = DVector::from_fn(m_iq, |i, _| -(s[i] * z[i]));
+        let Some((dx_aff, _dy_aff)) = solve_reduced_kkt(&h_bar, &ae, &rhs_x(&t_aff), &(-&r_eq))
+        else {
+            return make_sol(x, h, c, y, z, QpStatus::NumericalFailure, iters);
+        };
+        let ds_aff = -&r_iq - &ai * &dx_aff;
+        let dz_aff = dz_from(&t_aff, &ds_aff);
+
+        let alpha_aff_p = fraction_to_boundary(&s, &ds_aff, 1.0);
+        let alpha_aff_d = fraction_to_boundary(&z, &dz_aff, 1.0);
+        let s_aff = &s + alpha_aff_p * &ds_aff;
+        let z_aff = &z + alpha_aff_d * &dz_aff;
+        let mu_aff = s_aff.dot(&z_aff) / m_iq as f64;
+
+        // Mehrotra's centering parameter.
+        let sigma = if mu > 1e-14 { (mu_aff / mu).powi(3).clamp(0.0, 1.0) } else { 0.0 };
+        let sigma_mu = sigma * mu;
+
+        // ── Corrector: centered target + the affine step's 2nd-order term ──
+        let t_cor = DVector::from_fn(m_iq, |i, _| {
+            -(s[i] * z[i]) + sigma_mu - ds_aff[i] * dz_aff[i]
+        });
+        let Some((dx, dy)) = solve_reduced_kkt(&h_bar, &ae, &rhs_x(&t_cor), &(-&r_eq)) else {
+            return make_sol(x, h, c, y, z, QpStatus::NumericalFailure, iters);
+        };
+        let ds = -&r_iq - &ai * &dx;
+        let dz = dz_from(&t_cor, &ds);
+
+        let alpha_p = fraction_to_boundary(&s, &ds, TAU);
+        let alpha_d = fraction_to_boundary(&z, &dz, TAU);
+
+        x += alpha_p * &dx;
+        s += alpha_p * &ds;
+        y += alpha_d * &dy;
+        z += alpha_d * &dz;
+    }
+
+    make_sol(x, h, c, y, z, QpStatus::MaxIterations, iters)
+}
+
+/// `A_iqᵀ · diag(w) · A_iq`, the rank-`m_iq` term the IPM adds to `H`
+/// each iteration (the inequality "barrier Hessian"). Dense — this
+/// solver targets the same small/medium problems as [`ActiveSet`].
+fn weighted_normal_eq(ai: &DMatrix<f64>, w: &DVector<f64>) -> DMatrix<f64> {
+    let scaled = DMatrix::from_fn(ai.nrows(), ai.ncols(), |r, c| ai[(r, c)] * w[r]);
+    ai.transpose() * scaled
+}
+
+/// Solve the reduced (equality-only) KKT system
+/// `[H Aᵀ; A 0]·[dx;dy] = [rx;ry]` via one dense Cholesky of `H` and a
+/// Schur complement on the (typically small) equality block — the same
+/// two-stage solve the active-set backend uses per iteration, just
+/// without incremental factor updates (the IPM's `H` changes every
+/// iteration via the barrier term, so there is nothing to reuse across
+/// iterations here).
+fn solve_reduced_kkt(
+    h: &DMatrix<f64>,
+    ae: &DMatrix<f64>,
+    rx: &DVector<f64>,
+    ry: &DVector<f64>,
+) -> Option<(DVector<f64>, DVector<f64>)> {
+    let n = h.nrows();
+    let m_eq = ae.nrows();
+    let chol = match h.clone().cholesky() {
+        Some(c) => c,
+        None => (h + DMatrix::identity(n, n) * 1e-10).cholesky()?,
+    };
+    if m_eq == 0 {
+        return Some((chol.solve(rx), DVector::zeros(0)));
+    }
+    let h_inv_at = chol.solve(&ae.transpose());
+    let s = ae * &h_inv_at; // m_eq × m_eq Schur complement
+    let h_inv_rx = chol.solve(rx);
+    let rhs = ae * &h_inv_rx - ry;
+    let dy = s.lu().solve(&rhs)?;
+    let dx = h_inv_rx - &h_inv_at * &dy;
+    Some((dx, dy))
+}
+
+/// The fraction-to-boundary step length: the largest `α ∈ (0, α_max]`
+/// such that `v + α·dv ≥ (1 − τ)·v` component-wise (i.e. stays strictly
+/// positive with a `τ` safety margin). `α_max` is `1.0` for the final
+/// corrector step and also `1.0` for the affine predictor step (the
+/// predictor is allowed to reach the boundary — only used to measure
+/// achievable centering, never applied to `x`/`y` directly).
+fn fraction_to_boundary(v: &DVector<f64>, dv: &DVector<f64>, tau: f64) -> f64 {
+    let mut alpha = 1.0_f64;
+    for i in 0..v.len() {
+        if dv[i] < 0.0 {
+            alpha = alpha.min(-tau * v[i] / dv[i]);
+        }
+    }
+    alpha.clamp(0.0, 1.0)
 }
 
 // ─── Clarabel backend ───────────────────────────────────────────────────────
@@ -1914,6 +2137,78 @@ mod tests {
                 assert!(sol.lambda_iq[i] > -1e-6, "rows={rows}: dual infeasible at {i}");
             }
         }
+    }
+
+    // ─── Interior-point (Mehrotra predictor-corrector) ───────────────
+
+    #[test]
+    fn ipm_satisfies_kkt_on_random_problems() {
+        let mut rng = Lcg(0xC0FFEE);
+        let cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        for _ in 0..25 {
+            let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 10, 3, 12);
+            let sol = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            assert_kkt(&h, &c, &ae, &be, &ai, &bi, &sol);
+        }
+    }
+
+    #[test]
+    fn ipm_agrees_with_active_set_on_full_rank_problems() {
+        // Full rank ⇒ unique optimum, so the two independently-derived
+        // methods (barrier path-following vs active-set) must land on
+        // the same x, not just the same objective.
+        let mut rng = Lcg(0xFACADE);
+        let ipm_cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        let as_cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        for _ in 0..15 {
+            let n = 10;
+            let a = DMatrix::from_fn(n, n, |_, _| rng.next_f64());
+            let h = a.transpose() * &a + DMatrix::identity(n, n) * 0.5;
+            let c = DVector::from_fn(n, |_, _| rng.next_f64());
+            let d = DMatrix::from_fn(2 * n, n, |_, _| rng.next_f64());
+            let f = DVector::from_fn(2 * n, |_, _| rng.next_f64().abs() * 0.5 + 0.1);
+
+            let ipm = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &ipm_cfg);
+            let act = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &as_cfg);
+            assert_eq!(ipm.status, QpStatus::Optimal);
+            assert_eq!(act.status, QpStatus::Optimal);
+            assert!(
+                (&ipm.x - &act.x).norm() < 1e-4,
+                "ipm/active-set disagree: {:?} vs {:?}",
+                ipm.x,
+                act.x
+            );
+        }
+    }
+
+    #[test]
+    fn ipm_solves_equality_only_in_one_newton_step() {
+        // No inequalities: the KKT system is linear, so a single exact
+        // Newton step (the m_iq == 0 fast path) must already be optimal.
+        let a = DMatrix::from_row_slice(1, 2, &[1.0, 1.0]);
+        let b = DVector::from_vec(vec![1.0]);
+        let h = DMatrix::identity(2, 2);
+        let c = DVector::zeros(2);
+        let cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        let sol = solve_qp(&h, &c, Some(&a), Some(&b), None, None, None, &cfg);
+        assert_eq!(sol.status, QpStatus::Optimal);
+        // One Newton step to solve, one more loop entry to confirm
+        // convergence against the (now-zero) residual.
+        assert_eq!(sol.iterations, 2);
+        assert!((sol.x[0] - 0.5).abs() < 1e-8 && (sol.x[1] - 0.5).abs() < 1e-8);
+    }
+
+    #[test]
+    fn ipm_respects_max_iters_on_an_unreachable_tolerance() {
+        // A trivially-solvable QP but zero iteration budget must report
+        // MaxIterations rather than silently returning x = 0.
+        let h = DMatrix::identity(2, 2);
+        let c = DVector::from_vec(vec![-1.0, -1.0]);
+        let d = DMatrix::from_row_slice(1, 2, &[1.0, 1.0]);
+        let f = DVector::from_vec(vec![1.0]);
+        let cfg = QpConfig { solver: QpSolver::Ipm, max_iters: 0, ..Default::default() };
+        let sol = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
+        assert_eq!(sol.status, QpStatus::MaxIterations);
     }
 
 }

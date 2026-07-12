@@ -175,7 +175,11 @@ fn main() {
         (HqpStrategy::NullSpace, "NullSpace"),
         (HqpStrategy::ForceBudgetCascade, "ForceBudget"),
     ];
-    let backends = [(QpSolver::Clarabel, "Clarabel"), (QpSolver::ActiveSet, "ActiveSet")];
+    let backends = [
+        (QpSolver::Clarabel, "Clarabel"),
+        (QpSolver::ActiveSet, "ActiveSet"),
+        (QpSolver::Ipm, "Ipm"),
+    ];
 
     const WARMUP: usize = 5;
     const RUNS: usize = 50;
