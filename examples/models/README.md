@@ -16,3 +16,14 @@
   describe the same robot — not vendored in this repo. See the
   script's docstring for how the two URDFs were cross-checked before
   use, and `--mesh-dir` to point at your own copy.
+- `go2_topology.csv` — same idea as `panda_topology.csv`, regenerated
+  by `go2_leg_singularity_demo`.
+- The Go2 model itself (`go2.misa`) is **not** in this repo —
+  `go2_leg_singularity_demo.rs` loads it via a relative path into the
+  sibling `articara` checkout (`../../articara/models/unitree_go2/go2.misa`,
+  a submodule shared with `go2-gait-runner`). Only meaningful to run
+  with that sibling repo present; no video rendering pipeline exists
+  for it yet (unlike Panda, `go2.misa` already carries real meshes, so
+  `render_panda_vtk.py`'s external-mesh workaround wouldn't be needed —
+  just its hardcoded `N_Q`/column-layout constants would need
+  generalizing).

@@ -1,0 +1,17 @@
+idx,name,parent
+1,FL_hip_joint,0
+2,FR_hip_joint,0
+3,RL_hip_joint,0
+4,RR_hip_joint,0
+5,FL_thigh_joint,1
+6,FR_thigh_joint,2
+7,RL_thigh_joint,3
+8,RR_thigh_joint,4
+9,FL_calf_joint,5
+10,FR_calf_joint,6
+11,RL_calf_joint,7
+12,RR_calf_joint,8
+13,FL_foot_fixed,9
+14,FR_foot_fixed,10
+15,RL_foot_fixed,11
+16,RR_foot_fixed,12
