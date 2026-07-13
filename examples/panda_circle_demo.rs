@@ -134,6 +134,14 @@ fn main() {
             q[i] += v[i] * DT;
         }
 
+        // Numerical-divergence guard -- see panda_singularity_demo.rs
+        // for why this matters (a solver can report Optimal every tick
+        // while the integrated state quietly runs away).
+        if q.iter().chain(v.iter()).any(|x| !x.is_finite() || x.abs() > 1e3) {
+            eprintln!("STATE DIVERGED at tick {tick} (t={t:.4}s) -- stopping early, trace truncated here");
+            break;
+        }
+
         // Emit CSV row: tick,t,q...,ee_xyz,ref_xyz, then every link's
         // full world pose (translation + row-major rotation matrix),
         // joint 0 (universe root, = panda_link0) included so mesh

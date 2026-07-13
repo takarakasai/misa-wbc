@@ -183,6 +183,21 @@ fn main() {
             q[i] += v[i] * DT;
         }
 
+        // Numerical-divergence guard: a solver can keep reporting
+        // SolveStatus::Optimal every tick while the *state* it's
+        // integrating quietly runs away (measured on Explicit+Clarabel
+        // under cartesian_acceleration_damped -- see
+        // ref/wbc_comparison.md Sec.5n). Catch it here rather than
+        // grinding through the rest of the simulation on garbage state
+        // (which is also why that run took minutes instead of seconds).
+        // 1e3 rad / rad-s^-1 is already ~300x past any real joint limit
+        // or plausible velocity for this arm -- only genuine blow-up
+        // trips it.
+        if q.iter().chain(v.iter()).any(|x| !x.is_finite() || x.abs() > 1e3) {
+            eprintln!("STATE DIVERGED at tick {tick} (t={t:.4}s) -- stopping early, trace truncated here");
+            break;
+        }
+
         print!("{tick},{t:.4}");
         for &qi in &q {
             print!(",{qi:.5}");
