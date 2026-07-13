@@ -72,10 +72,45 @@ fn main() {
         env!("CARGO_MANIFEST_DIR")
     );
     let parsed = misarta::native::load(std::path::Path::new(&path)).expect("load go2.misa");
-    let (model, _vis, _col) = misarta::native::build_model(&parsed.file).expect("build go2 model");
+    let (model, vis, _col) = misarta::native::build_model(&parsed.file).expect("build go2 model");
     let (nv, nq) = (model.nv, model.nq);
     assert_eq!(nq, nv, "fixed-base quadruped (no floating joint) expected");
     let na = nv;
+
+    // Mesh manifest (written once): unlike the Panda demo, go2.misa
+    // already carries real visual meshes (unitree's own .obj files),
+    // each with a non-trivial per-mesh placement (some visuals are
+    // rotated -- see e.g. FR_hip's meshes, rpy=[pi,0,0]) relative to
+    // their parent joint. Dump parent joint index + resolved mesh path
+    // + placement (translation, row-major rotation) so the renderer
+    // can compose world_T_mesh = oMi[parent_joint] * placement without
+    // re-deriving any of this from the .misa TOML itself.
+    {
+        let mesh_dir = std::path::Path::new(&path).parent().unwrap().to_path_buf();
+        let manifest_path = format!("{}/examples/models/go2_mesh_manifest.csv", env!("CARGO_MANIFEST_DIR"));
+        let mut manifest = String::from("parent_joint,mesh_path,tx,ty,tz,r00,r01,r02,r10,r11,r12,r20,r21,r22\n");
+        for obj in &vis.objects {
+            if let Some(mesh_path) = &obj.mesh_path {
+                let resolved = mesh_dir.join(mesh_path);
+                let t = se3::translation(&obj.placement);
+                let r = se3::rotation_matrix(&obj.placement);
+                manifest.push_str(&format!(
+                    "{},{},{:.6},{:.6},{:.6}",
+                    obj.parent_joint,
+                    resolved.display(),
+                    t.x, t.y, t.z
+                ));
+                for row in 0..3 {
+                    for col in 0..3 {
+                        manifest.push_str(&format!(",{:.6}", r[(row, col)]));
+                    }
+                }
+                manifest.push('\n');
+            }
+        }
+        std::fs::write(&manifest_path, manifest).expect("write mesh manifest");
+        eprintln!("wrote mesh manifest to {manifest_path}");
+    }
 
     let ee_idx = model
         .joints

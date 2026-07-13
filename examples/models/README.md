@@ -18,12 +18,17 @@
   use, and `--mesh-dir` to point at your own copy.
 - `go2_topology.csv` — same idea as `panda_topology.csv`, regenerated
   by `go2_leg_singularity_demo`.
+- `go2_mesh_manifest.csv` — regenerated each run: for every visual
+  `GeometryObject` in the model (`build_model`'s `vis` return value),
+  its parent joint index, resolved `.obj` path, and static placement
+  (translation + rotation) relative to that joint. Unlike Panda's
+  meshes (zero visual offset, verified by hand), several of Go2's own
+  meshes carry a real per-mesh rotation (e.g. `FR_hip`'s, `rpy=[pi,0,0]`),
+  so this is read straight from `GeometryObject::placement` rather than
+  assumed — see `../render_go2_vtk.py`.
 - The Go2 model itself (`go2.misa`) is **not** in this repo —
   `go2_leg_singularity_demo.rs` loads it via a relative path into the
   sibling `articara` checkout (`../../articara/models/unitree_go2/go2.misa`,
-  a submodule shared with `go2-gait-runner`). Only meaningful to run
-  with that sibling repo present; no video rendering pipeline exists
-  for it yet (unlike Panda, `go2.misa` already carries real meshes, so
-  `render_panda_vtk.py`'s external-mesh workaround wouldn't be needed —
-  just its hardcoded `N_Q`/column-layout constants would need
-  generalizing).
+  a submodule shared with `go2-gait-runner`), including its real
+  `.obj` meshes (`assets/`) — no external mesh source needed, unlike
+  Panda. Only meaningful to run with that sibling repo present.
