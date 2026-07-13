@@ -12,9 +12,14 @@
 //! combination for a controlled comparison:
 //!
 //! ```text
-//! cargo run --release --example panda_singularity_demo -- <formulation> <backend>
+//! cargo run --release --example panda_singularity_demo -- <formulation> <backend> [damped]
 //! formulation: explicit | accel | force
 //! backend:     activeset | ipm | admm | clarabel
+//! damped:      literal "damped" to swap in tasks::cartesian_acceleration_damped
+//!              (SingularityDamping::default(), or override lambda_max_sq via the
+//!              LAMBDA_MAX_SQ env var) -- see ref/wbc_comparison.md Sec.5n for the
+//!              backend-dependent results (reliable win on Ipm/Admm, validate
+//!              first on ActiveSet/Clarabel -- one measured combination diverges).
 //! ```
 //!
 //! CSV column layout is a superset of `panda_circle_demo.rs`'s (same
@@ -59,7 +64,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let formulation = parse_formulation(args.get(1).map(|s| s.as_str()).unwrap_or("explicit"));
     let backend = parse_backend(args.get(2).map(|s| s.as_str()).unwrap_or("activeset"));
-    eprintln!("formulation={:?} backend={:?}", formulation, backend);
+    let damped = args.get(3).map(|s| s.as_str()) == Some("damped");
+    eprintln!("formulation={:?} backend={:?} damped={damped}", formulation, backend);
 
     let path = format!("{}/examples/models/panda.urdf", env!("CARGO_MANIFEST_DIR"));
     let imported = misarta_formats::urdf::import(std::path::Path::new(&path)).expect("import panda.urdf");
@@ -149,7 +155,15 @@ fn main() {
         if let Some(phys) = d.dynamics_task() {
             p0 = phys + p0;
         }
-        let p1 = tasks::cartesian_acceleration(d.qddot(), &j_ee, &dj_v, &a_ref);
+        let p1 = if damped {
+            let mut cfg = tasks::SingularityDamping::default();
+            if let Ok(l) = std::env::var("LAMBDA_MAX_SQ") {
+                cfg.lambda_max_sq = l.parse().expect("LAMBDA_MAX_SQ must be a float");
+            }
+            tasks::cartesian_acceleration_damped(d.qddot(), &j_ee, &dj_v, &a_ref, &cfg)
+        } else {
+            tasks::cartesian_acceleration(d.qddot(), &j_ee, &dj_v, &a_ref)
+        };
         let p2 = tasks::track(d.qddot(), &DVector::zeros(nv))
             + tasks::track(d.tau(), &DVector::zeros(na)).weight(0.01);
 

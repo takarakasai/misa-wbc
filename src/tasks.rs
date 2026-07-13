@@ -17,6 +17,7 @@
 //! |---|---|
 //! | [`equation_of_motion`] | DynamicFeasibility / floating-base EoM |
 //! | [`cartesian_acceleration`] | acceleration::Cartesian / CoM / Contact |
+//! | [`cartesian_acceleration_damped`] | (misa-wbc addition — singularity-robust DLS variant) |
 //! | [`track`] | acceleration::Postural, swing-leg, force/τ regularisation |
 //! | [`friction_pyramid`] | constraints::force::FrictionCone |
 //! | [`patch_contact`] | GID SetContactSupport / OpenSoT CoP+WrenchLimits |
@@ -88,6 +89,86 @@ pub fn cartesian_acceleration(
     // expr = J·q̈ + J̇·v ;  track toward accel_ref.
     let expr = &(j * &qddot.as_affine()) + dj_v;
     track(&expr, accel_ref)
+}
+
+/// Tuning knobs for [`cartesian_acceleration_damped`]'s singularity
+/// robustness. The defaults ([`Default::default`]) are reasonable for
+/// an arm-scale manipulator (Panda-like reach); retune `sigma_lo` /
+/// `sigma_hi` from a manipulability sweep of your own robot if its
+/// healthy `sigma_min(J)` range sits elsewhere.
+#[derive(Clone, Copy, Debug)]
+pub struct SingularityDamping {
+    /// `sigma_min(J)` at/below which damping is fully engaged
+    /// (`lambda²` reaches `lambda_max_sq`).
+    pub sigma_lo: f64,
+    /// `sigma_min(J)` at/above which damping is fully disengaged
+    /// (`lambda² = 0`, identical to plain [`cartesian_acceleration`]).
+    pub sigma_hi: f64,
+    /// Damping weight at full engagement, `lambda²` in
+    /// `‖J·q̈ + J̇·v − accel_ref‖² + lambda²·‖q̈‖²`.
+    pub lambda_max_sq: f64,
+}
+
+impl Default for SingularityDamping {
+    fn default() -> Self {
+        Self { sigma_lo: 0.01, sigma_hi: 0.08, lambda_max_sq: 5e-3 }
+    }
+}
+
+/// [`cartesian_acceleration`], plus automatic damped-least-squares
+/// regularisation as the task Jacobian `j` approaches a kinematic
+/// singularity — a drop-in replacement that needs nothing extra from
+/// the caller beyond the same `j` it already has to hand.
+///
+/// Internally computes `sigma_min(j)` (one small SVD, `j` is already
+/// task-scale — 3 to 6 rows typically) each call and smoothly ramps in
+/// a `lambda²·‖q̈‖²` joint-space cost as `sigma_min` falls from
+/// `sigma_hi` to `sigma_lo` ([`SingularityDamping`]) — the classic
+/// Nakamura-Hanafusa / Deo-Walker damped-least-squares fix for the
+/// inverse-Jacobian blowup at a singularity, expressed as a QP cost
+/// rather than a matrix pseudo-inverse.
+///
+/// **Must replace [`cartesian_acceleration`] at the same priority
+/// level**, not be added as a separate lower-priority task: under
+/// [`crate::HqpStrategy::NullSpace`], a lower-priority regulariser only
+/// acts in the null space of this level's own (undamped) solve, so it
+/// cannot damp the ill-conditioning happening *inside* this level.
+/// Composing the damping into this task, in this function, is what
+/// makes that a non-issue for the caller.
+///
+/// **Backend caveat, measured on the Panda singularity-approach study**
+/// (`examples/panda_singularity_demo.rs`, `ref/wbc_comparison.md`
+/// Sec.5n in the misarta-adjacent `articara` repo): this reliably
+/// helps [`crate::QpSolver::Ipm`] and [`crate::QpSolver::Admm`] — both
+/// lack any internal ill-conditioning safeguard of their own, and
+/// every formulation paired with either backend improved substantially
+/// (degraded-tick counts falling by 10-250x). [`crate::QpSolver::ActiveSet`]
+/// (conditional-ridge Cholesky) and [`crate::QpSolver::Clarabel`]
+/// (mature IPM) already handle the ill-conditioning internally, and
+/// layering this on top was inconsistent for them — sometimes a further
+/// improvement, occasionally worse, and in one measured case
+/// (`Formulation::Explicit` + `Clarabel`) a catastrophic numerical
+/// blow-up (state diverging past 1e13 within a few seconds). Prefer
+/// plain [`cartesian_acceleration`] with ActiveSet/Clarabel unless
+/// you've validated this function against your own trajectory first.
+pub fn cartesian_acceleration_damped(
+    qddot: &impl AsAffine,
+    j: &DMatrix<f64>,
+    dj_v: &DVector<f64>,
+    accel_ref: &DVector<f64>,
+    damping: &SingularityDamping,
+) -> Task {
+    let sigma_min = {
+        let svd = nalgebra::linalg::SVD::new(j.clone(), false, false);
+        svd.singular_values.iter().cloned().fold(f64::INFINITY, f64::min)
+    };
+    let span = (damping.sigma_hi - damping.sigma_lo).max(1e-12);
+    let ramp = ((damping.sigma_hi - sigma_min) / span).clamp(0.0, 1.0);
+    let lambda_sq = damping.lambda_max_sq * ramp * ramp;
+
+    let n = qddot.out_size();
+    cartesian_acceleration(qddot, j, dj_v, accel_ref)
+        + regularize(qddot, &DVector::zeros(n)).weight(lambda_sq)
 }
 
 /// Rigid-contact no-motion constraint: a stance point holds still, so
@@ -433,6 +514,80 @@ mod tests {
         assert_eq!(t.n_eq(), 1);
         let x = DVector::from_vec(vec![1.5, 9.9]);
         assert!((&t.a * &x - &t.b).norm() < 1e-12);
+    }
+
+    #[test]
+    fn damped_matches_undamped_far_from_singularity() {
+        // J = I(2): sigma_min = 1.0, well above the default sigma_hi
+        // (0.08) -- the ramp should be fully off, so the appended
+        // regularisation rows carry zero weight (all-zero, inert).
+        let l = layout(2, 0, 0);
+        let q = l.var("qddot");
+        let j = DMatrix::<f64>::identity(2, 2);
+        let dj_v = DVector::zeros(2);
+        let aref = DVector::from_vec(vec![3.0, -1.0]);
+        let plain = cartesian_acceleration(&q, &j, &dj_v, &aref);
+        let damped = cartesian_acceleration_damped(&q, &j, &dj_v, &aref, &SingularityDamping::default());
+
+        assert_eq!(damped.n_eq(), plain.n_eq() + 2, "regularisation rows appended");
+        let extra_a = damped.a.rows(plain.n_eq(), 2);
+        let extra_b = damped.b.rows(plain.n_eq(), 2);
+        assert!(extra_a.norm() < 1e-12, "damping rows should be zero-weighted, got {extra_a}");
+        assert!(extra_b.norm() < 1e-12);
+    }
+
+    #[test]
+    fn damped_engages_full_regularisation_at_a_singularity() {
+        // J = diag(1, 0): sigma_min = 0, at/below sigma_lo -- ramp = 1,
+        // so the appended block should be exactly sqrt(lambda_max_sq)*I.
+        let l = layout(2, 0, 0);
+        let q = l.var("qddot");
+        let j = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 0.0]);
+        let dj_v = DVector::zeros(2);
+        let aref = DVector::from_vec(vec![1.0, 1.0]);
+        let cfg = SingularityDamping::default();
+        let damped = cartesian_acceleration_damped(&q, &j, &dj_v, &aref, &cfg);
+
+        let plain_eq = cartesian_acceleration(&q, &j, &dj_v, &aref).n_eq();
+        let extra_a = damped.a.rows(plain_eq, 2).into_owned();
+        let expected = DMatrix::<f64>::identity(2, 2) * cfg.lambda_max_sq.sqrt();
+        assert!((extra_a - expected).norm() < 1e-9, "expected full-strength damping at sigma_min=0");
+    }
+
+    #[test]
+    fn damped_bounds_qddot_through_a_synthetic_singularity() {
+        // J(theta) = diag(1, theta): decouples into q1 = accel_ref[0]
+        // (always well-posed) and theta*q2 = accel_ref[1]. Undamped LSQ
+        // optimum for the second row is q2 = accel_ref[1]/theta, which
+        // is unbounded as theta -> 0 -- the textbook DLS blow-up.
+        // Damped optimum is theta*accel_ref[1]/(theta^2+lambda_sq),
+        // bounded by accel_ref[1]/(2*sqrt(lambda_sq)) for every theta.
+        let l = layout(2, 0, 0);
+        let q = l.var("qddot");
+        let dj_v = DVector::zeros(2);
+        let aref = DVector::from_vec(vec![0.0, 10.0]);
+        let cfg = SingularityDamping { sigma_lo: 0.01, sigma_hi: 0.08, lambda_max_sq: 5e-3 };
+        let bound = 10.0 / (2.0 * cfg.lambda_max_sq.sqrt());
+
+        // Every theta here is at/inside sigma_lo, so the ramp is fully
+        // engaged (lambda_sq == lambda_max_sq) and the closed-form
+        // bound above applies uniformly; the transition region itself
+        // is covered by the two ramp tests above.
+        for theta in [0.01, 0.005, 0.002, 0.0, -0.005] {
+            let j = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, theta]);
+            let damped = cartesian_acceleration_damped(&q, &j, &dj_v, &aref, &cfg);
+            // Solve the level's own 2x2 normal equations directly
+            // (H = AᵀA, g = -Aᵀb) -- no need to pull in the QP backend
+            // for an unconstrained least-squares check.
+            let h = damped.a.transpose() * &damped.a;
+            let g = damped.a.transpose() * &damped.b;
+            let x = h.lu().solve(&g).expect("well-posed by construction (lambda_sq > 0)");
+            assert!(
+                x.norm() <= bound + 1e-6,
+                "theta={theta}: qddot norm {} exceeded the DLS bound {bound}",
+                x.norm()
+            );
+        }
     }
 
     fn uniform_cbf(n: usize, q_min: f64, q_max: f64, v_max: f64, a_max: f64, a1: f64, a2: f64, a3: f64) -> JointLimitCbf {
