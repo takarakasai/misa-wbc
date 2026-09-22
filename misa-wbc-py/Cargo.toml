@@ -1,0 +1,16 @@
+[package]
+name = "misa-wbc-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for misa-wbc — hierarchical whole-body control."
+license = "Apache-2.0"
+
+[lib]
+name = "_misa_wbc"
+crate-type = ["cdylib"]
+
+[dependencies]
+misa-wbc = { path = ".." }
+nalgebra = "0.34.2"
+numpy = "0.22"
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }

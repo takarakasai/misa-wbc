@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "misa-wbc"
+version = "0.1.0"
+description = "Python bindings for misa-wbc — hierarchical whole-body control."
+license = { text = "Apache-2.0" }
+authors = [{ name = "Takara Kasai", email = "takara.kasai@gmail.com" }]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "misa_wbc._misa_wbc"
+python-source = "python"
+manifest-path = "Cargo.toml"
