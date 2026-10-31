@@ -14,7 +14,7 @@
 #![cfg(feature = "clarabel")]
 
 use misa_wbc::tasks::{self, JointLimitCbf};
-use misa_wbc::{solve, SolveConfig, SolveStatus, VarLayout};
+use misa_wbc::{SolveConfig, SolveStatus, VarLayout, solve};
 use nalgebra::DVector;
 
 /// 1-DOF double integrator (`q̈ = u`) under closed-loop CBF safety +
@@ -39,7 +39,11 @@ fn simulate(limits: &JointLimitCbf, ticks: usize, dt: f64) -> Vec<f64> {
         let p1 = tasks::regularize(&qddot, &DVector::from_vec(vec![1000.0]));
 
         let sol = solve(&[p0, p1], &SolveConfig::default()).expect("solve");
-        assert_eq!(sol.status, SolveStatus::Optimal, "solver degraded mid-simulation");
+        assert_eq!(
+            sol.status,
+            SolveStatus::Optimal,
+            "solver degraded mid-simulation"
+        );
 
         let a = sol.x[0];
         // Semi-implicit Euler: update v first, then use the new v for q

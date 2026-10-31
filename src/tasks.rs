@@ -83,9 +83,21 @@ pub fn cartesian_acceleration(
     dj_v: &DVector<f64>,
     accel_ref: &DVector<f64>,
 ) -> Task {
-    assert_eq!(j.ncols(), qddot.out_size(), "cartesian: J cols must equal qddot size");
-    assert_eq!(j.nrows(), dj_v.len(), "cartesian: J rows must equal dj_v len");
-    assert_eq!(j.nrows(), accel_ref.len(), "cartesian: J rows must equal accel_ref len");
+    assert_eq!(
+        j.ncols(),
+        qddot.out_size(),
+        "cartesian: J cols must equal qddot size"
+    );
+    assert_eq!(
+        j.nrows(),
+        dj_v.len(),
+        "cartesian: J rows must equal dj_v len"
+    );
+    assert_eq!(
+        j.nrows(),
+        accel_ref.len(),
+        "cartesian: J rows must equal accel_ref len"
+    );
     // expr = J·q̈ + J̇·v ;  track toward accel_ref.
     let expr = &(j * &qddot.as_affine()) + dj_v;
     track(&expr, accel_ref)
@@ -111,7 +123,11 @@ pub struct SingularityDamping {
 
 impl Default for SingularityDamping {
     fn default() -> Self {
-        Self { sigma_lo: 0.01, sigma_hi: 0.08, lambda_max_sq: 5e-3 }
+        Self {
+            sigma_lo: 0.01,
+            sigma_hi: 0.08,
+            lambda_max_sq: 5e-3,
+        }
     }
 }
 
@@ -160,7 +176,10 @@ pub fn cartesian_acceleration_damped(
 ) -> Task {
     let sigma_min = {
         let svd = nalgebra::linalg::SVD::new(j.clone(), false, false);
-        svd.singular_values.iter().cloned().fold(f64::INFINITY, f64::min)
+        svd.singular_values
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min)
     };
     let span = (damping.sigma_hi - damping.sigma_lo).max(1e-12);
     let ramp = ((damping.sigma_hi - sigma_min) / span).clamp(0.0, 1.0);
@@ -217,7 +236,11 @@ pub fn equation_of_motion(
     assert_eq!(mass.shape(), (nv, nv), "eom: M must be nv × nv");
     assert_eq!(nle.len(), nv, "eom: h must have length nv");
     assert_eq!(j_contact.ncols(), nv, "eom: j_contact must have nv columns");
-    assert_eq!(j_contact.nrows(), forces.size(), "eom: j_contact rows must equal forces size");
+    assert_eq!(
+        j_contact.nrows(),
+        forces.size(),
+        "eom: j_contact rows must equal forces size"
+    );
     assert!(na <= nv, "eom: na ({na}) must be ≤ nv ({nv})");
 
     let n_base = nv - na;
@@ -253,7 +276,11 @@ pub fn equation_of_motion(
 /// caller's force by the world→contact rotation, or use a rotated `C`
 /// (a `world_to_contact` overload lands with the model integration).
 pub fn friction_pyramid(force: &impl AsAffine, mu: f64) -> Task {
-    assert_eq!(force.out_size(), 3, "friction_pyramid: force expression must be 3-D");
+    assert_eq!(
+        force.out_size(),
+        3,
+        "friction_pyramid: force expression must be 3-D"
+    );
     #[rustfmt::skip]
     let c = DMatrix::from_row_slice(5, 3, &[
         0.0,  0.0, -1.0,
@@ -290,9 +317,21 @@ pub fn centroidal_momentum(
     dcmm_v: &DVector<f64>,
     h_rate_ref: &DVector<f64>,
 ) -> Task {
-    assert_eq!(cmm.ncols(), qddot.out_size(), "momentum: CMM cols must equal qddot size");
-    assert_eq!(cmm.nrows(), dcmm_v.len(), "momentum: CMM rows must equal dcmm_v len");
-    assert_eq!(cmm.nrows(), h_rate_ref.len(), "momentum: CMM rows must equal ref len");
+    assert_eq!(
+        cmm.ncols(),
+        qddot.out_size(),
+        "momentum: CMM cols must equal qddot size"
+    );
+    assert_eq!(
+        cmm.nrows(),
+        dcmm_v.len(),
+        "momentum: CMM rows must equal dcmm_v len"
+    );
+    assert_eq!(
+        cmm.nrows(),
+        h_rate_ref.len(),
+        "momentum: CMM rows must equal ref len"
+    );
     // Same shape as cartesian_acceleration with J = A_G — named so the
     // balance intent reads at call sites.
     cartesian_acceleration(qddot, cmm, dcmm_v, h_rate_ref)
@@ -360,16 +399,33 @@ pub struct JointLimitCbf {
 ///
 /// `q`, `q̇` are this DOF group's current position/velocity (already
 /// sliced to match `limits`'s length and `qddot`'s output dimension).
-pub fn joint_limit_cbf(qddot: &impl AsAffine, q: &DVector<f64>, v: &DVector<f64>, limits: &JointLimitCbf) -> Task {
+pub fn joint_limit_cbf(
+    qddot: &impl AsAffine,
+    q: &DVector<f64>,
+    v: &DVector<f64>,
+    limits: &JointLimitCbf,
+) -> Task {
     let n = q.len();
-    assert_eq!(qddot.out_size(), n, "joint_limit_cbf: qddot size must match q");
+    assert_eq!(
+        qddot.out_size(),
+        n,
+        "joint_limit_cbf: qddot size must match q"
+    );
     assert_eq!(v.len(), n, "joint_limit_cbf: v size must match q");
     for (name, field) in [
-        ("q_min", &limits.q_min), ("q_max", &limits.q_max), ("v_max", &limits.v_max),
-        ("a_max", &limits.a_max), ("alpha1", &limits.alpha1), ("alpha2", &limits.alpha2),
+        ("q_min", &limits.q_min),
+        ("q_max", &limits.q_max),
+        ("v_max", &limits.v_max),
+        ("a_max", &limits.a_max),
+        ("alpha1", &limits.alpha1),
+        ("alpha2", &limits.alpha2),
         ("alpha3", &limits.alpha3),
     ] {
-        assert_eq!(field.len(), n, "joint_limit_cbf: {name} length must match q");
+        assert_eq!(
+            field.len(),
+            n,
+            "joint_limit_cbf: {name} length must match q"
+        );
     }
 
     let mut lb = DVector::zeros(n);
@@ -380,8 +436,12 @@ pub fn joint_limit_cbf(qddot: &impl AsAffine, q: &DVector<f64>, v: &DVector<f64>
         let upper_ecbf = damping + a1 * a2 * (limits.q_max[i] - q[i]);
         let lower_ecbf = damping + a1 * a2 * (limits.q_min[i] - q[i]);
 
-        let mut u = upper_ecbf.min(a3 * (limits.v_max[i] - v[i])).min(limits.a_max[i]);
-        let mut l = lower_ecbf.max(a3 * (-limits.v_max[i] - v[i])).max(-limits.a_max[i]);
+        let mut u = upper_ecbf
+            .min(a3 * (limits.v_max[i] - v[i]))
+            .min(limits.a_max[i]);
+        let mut l = lower_ecbf
+            .max(a3 * (-limits.v_max[i] - v[i]))
+            .max(-limits.a_max[i]);
         if u < l {
             std::mem::swap(&mut u, &mut l);
         }
@@ -427,7 +487,11 @@ pub struct ContactPatch {
 /// coupling rows) as one task. For a 3-D point contact use
 /// [`friction_pyramid`] instead.
 pub fn patch_contact(wrench: &impl AsAffine, patch: &ContactPatch) -> Task {
-    assert_eq!(wrench.out_size(), 6, "patch_contact: wrench must be 6-D [m; f]");
+    assert_eq!(
+        wrench.out_size(),
+        6,
+        "patch_contact: wrench must be 6-D [m; f]"
+    );
     let (mx, my, mz, fx, fy, fz) = (0, 1, 2, 3, 4, 5);
     let (lx, ly) = patch.cop_half;
     let mut c = DMatrix::zeros(12, 6);
@@ -442,9 +506,12 @@ pub fn patch_contact(wrench: &impl AsAffine, patch: &ContactPatch) -> Task {
         c[(row, fz)] = -patch.mu;
     }
     // CoP box:  |mx| ≤ Ly·fz,  |my| ≤ Lx·fz
-    for (row, axis, sign, half) in
-        [(6, mx, 1.0, ly), (7, mx, -1.0, ly), (8, my, 1.0, lx), (9, my, -1.0, lx)]
-    {
+    for (row, axis, sign, half) in [
+        (6, mx, 1.0, ly),
+        (7, mx, -1.0, ly),
+        (8, my, 1.0, lx),
+        (9, my, -1.0, lx),
+    ] {
         c[(row, axis)] = sign;
         c[(row, fz)] = -half;
     }
@@ -527,12 +594,20 @@ mod tests {
         let dj_v = DVector::zeros(2);
         let aref = DVector::from_vec(vec![3.0, -1.0]);
         let plain = cartesian_acceleration(&q, &j, &dj_v, &aref);
-        let damped = cartesian_acceleration_damped(&q, &j, &dj_v, &aref, &SingularityDamping::default());
+        let damped =
+            cartesian_acceleration_damped(&q, &j, &dj_v, &aref, &SingularityDamping::default());
 
-        assert_eq!(damped.n_eq(), plain.n_eq() + 2, "regularisation rows appended");
+        assert_eq!(
+            damped.n_eq(),
+            plain.n_eq() + 2,
+            "regularisation rows appended"
+        );
         let extra_a = damped.a.rows(plain.n_eq(), 2);
         let extra_b = damped.b.rows(plain.n_eq(), 2);
-        assert!(extra_a.norm() < 1e-12, "damping rows should be zero-weighted, got {extra_a}");
+        assert!(
+            extra_a.norm() < 1e-12,
+            "damping rows should be zero-weighted, got {extra_a}"
+        );
         assert!(extra_b.norm() < 1e-12);
     }
 
@@ -551,7 +626,10 @@ mod tests {
         let plain_eq = cartesian_acceleration(&q, &j, &dj_v, &aref).n_eq();
         let extra_a = damped.a.rows(plain_eq, 2).into_owned();
         let expected = DMatrix::<f64>::identity(2, 2) * cfg.lambda_max_sq.sqrt();
-        assert!((extra_a - expected).norm() < 1e-9, "expected full-strength damping at sigma_min=0");
+        assert!(
+            (extra_a - expected).norm() < 1e-9,
+            "expected full-strength damping at sigma_min=0"
+        );
     }
 
     #[test]
@@ -566,7 +644,11 @@ mod tests {
         let q = l.var("qddot");
         let dj_v = DVector::zeros(2);
         let aref = DVector::from_vec(vec![0.0, 10.0]);
-        let cfg = SingularityDamping { sigma_lo: 0.01, sigma_hi: 0.08, lambda_max_sq: 5e-3 };
+        let cfg = SingularityDamping {
+            sigma_lo: 0.01,
+            sigma_hi: 0.08,
+            lambda_max_sq: 5e-3,
+        };
         let bound = 10.0 / (2.0 * cfg.lambda_max_sq.sqrt());
 
         // Every theta here is at/inside sigma_lo, so the ramp is fully
@@ -581,7 +663,10 @@ mod tests {
             // for an unconstrained least-squares check.
             let h = damped.a.transpose() * &damped.a;
             let g = damped.a.transpose() * &damped.b;
-            let x = h.lu().solve(&g).expect("well-posed by construction (lambda_sq > 0)");
+            let x = h
+                .lu()
+                .solve(&g)
+                .expect("well-posed by construction (lambda_sq > 0)");
             assert!(
                 x.norm() <= bound + 1e-6,
                 "theta={theta}: qddot norm {} exceeded the DLS bound {bound}",
@@ -590,7 +675,16 @@ mod tests {
         }
     }
 
-    fn uniform_cbf(n: usize, q_min: f64, q_max: f64, v_max: f64, a_max: f64, a1: f64, a2: f64, a3: f64) -> JointLimitCbf {
+    fn uniform_cbf(
+        n: usize,
+        q_min: f64,
+        q_max: f64,
+        v_max: f64,
+        a_max: f64,
+        a1: f64,
+        a2: f64,
+        a3: f64,
+    ) -> JointLimitCbf {
         JointLimitCbf {
             q_min: DVector::from_element(n, q_min),
             q_max: DVector::from_element(n, q_max),
@@ -628,7 +722,10 @@ mod tests {
         // a_max=10 — i.e. the hard box, not a tighter one.
         // (upper bound row: coefficient +1 on qddot, rhs = ub)
         let ub_row0 = t.f[0]; // le rows come first in Task::in_range
-        assert!((ub_row0 - 10.0).abs() < 1e-9, "expected a_max clamp, got {ub_row0}");
+        assert!(
+            (ub_row0 - 10.0).abs() < 1e-9,
+            "expected a_max clamp, got {ub_row0}"
+        );
     }
 
     #[test]
@@ -663,7 +760,10 @@ mod tests {
 
         // Velocity barrier: alpha3*(v_max - v) = 4*(2-2) = 0.
         let ub = t.f[0];
-        assert!(ub <= 1e-9, "velocity-at-limit should cap qddot near 0, got {ub}");
+        assert!(
+            ub <= 1e-9,
+            "velocity-at-limit should cap qddot near 0, got {ub}"
+        );
     }
 
     #[test]
@@ -684,7 +784,10 @@ mod tests {
         // row 1 encodes lb as `q ≥ lb` ⇒ f[1] = -lb) must describe a
         // non-empty interval, not one the swap left inverted.
         let (ub, lb) = (t.f[0], -t.f[1]);
-        assert!(lb <= ub + 1e-9, "swapped interval should be non-empty: lb={lb} ub={ub}");
+        assert!(
+            lb <= ub + 1e-9,
+            "swapped interval should be non-empty: lb={lb} ub={ub}"
+        );
     }
 
     #[test]
@@ -697,18 +800,30 @@ mod tests {
         let x = DVector::from_vec(vec![0.1, -0.1, 1.0]);
         let lhs = &t.d * &x;
         for i in 0..5 {
-            assert!(lhs[i] <= 1e-12, "inside-cone force violates row {i}: {}", lhs[i]);
+            assert!(
+                lhs[i] <= 1e-12,
+                "inside-cone force violates row {i}: {}",
+                lhs[i]
+            );
         }
         // A pulling force (fz < 0) violates the unilateral row.
         let pull = DVector::from_vec(vec![0.0, 0.0, -1.0]);
-        assert!((&t.d * &pull)[0] > 0.0, "pull should violate unilateral row");
+        assert!(
+            (&t.d * &pull)[0] > 0.0,
+            "pull should violate unilateral row"
+        );
     }
 
     #[test]
     fn patch_contact_rows() {
         let l = VarLayout::builder().add("w", 6).build();
         let w = l.var("w");
-        let patch = ContactPatch { mu: 0.5, cop_half: (0.10, 0.05), mu_torsion: 0.02, f_max: 200.0 };
+        let patch = ContactPatch {
+            mu: 0.5,
+            cop_half: (0.10, 0.05),
+            mu_torsion: 0.02,
+            f_max: 200.0,
+        };
         let t = patch_contact(&w, &patch);
         assert_eq!(t.n_iq(), 12);
 
@@ -716,7 +831,11 @@ mod tests {
         //   w = [mx, my, mz, fx, fy, fz]
         let ok = DVector::from_vec(vec![1.0, 2.0, 0.5, 10.0, -10.0, 100.0]);
         let m = &t.f - &t.d * &ok;
-        assert!(m.min() > 0.0, "inside wrench should have positive margin: {}", m.min());
+        assert!(
+            m.min() > 0.0,
+            "inside wrench should have positive margin: {}",
+            m.min()
+        );
 
         // Violations, one row family at a time.
         let pull = DVector::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.0, -1.0]);
@@ -724,11 +843,20 @@ mod tests {
         let cap = DVector::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.0, 300.0]);
         assert!((&t.f - &t.d * &cap).min() < 0.0, "f_max must bind");
         let slip = DVector::from_vec(vec![0.0, 0.0, 0.0, 80.0, 0.0, 100.0]);
-        assert!((&t.f - &t.d * &slip).min() < 0.0, "friction must bind (80 > 0.5·100)");
+        assert!(
+            (&t.f - &t.d * &slip).min() < 0.0,
+            "friction must bind (80 > 0.5·100)"
+        );
         let cop = DVector::from_vec(vec![10.0, 0.0, 0.0, 0.0, 0.0, 100.0]);
-        assert!((&t.f - &t.d * &cop).min() < 0.0, "CoP must bind (10 > 0.05·100)");
+        assert!(
+            (&t.f - &t.d * &cop).min() < 0.0,
+            "CoP must bind (10 > 0.05·100)"
+        );
         let twist = DVector::from_vec(vec![0.0, 0.0, 5.0, 0.0, 0.0, 100.0]);
-        assert!((&t.f - &t.d * &twist).min() < 0.0, "torsion must bind (5 > 0.02·100)");
+        assert!(
+            (&t.f - &t.d * &twist).min() < 0.0,
+            "torsion must bind (5 > 0.02·100)"
+        );
     }
 
     #[test]
@@ -765,7 +893,8 @@ mod tests {
         let n = l.n_decision();
         let mut a = DMatrix::zeros(nv, n);
         a.view_mut((0, q.offset()), (nv, nv)).copy_from(&mass);
-        a.view_mut((0, f.offset()), (nv, 3 * nc)).copy_from(&(-jc.transpose()));
+        a.view_mut((0, f.offset()), (nv, 3 * nc))
+            .copy_from(&(-jc.transpose()));
         let n_base = nv - na;
         for i in 0..na {
             a[(n_base + i, tau.offset() + i)] = -1.0;

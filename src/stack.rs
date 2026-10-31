@@ -45,7 +45,7 @@ use std::fmt;
 use nalgebra::DVector;
 
 use crate::affine::VarLayout;
-use crate::solve::{solve_warm, Solution, SolveConfig, SolveStatus, Solver, WbcError};
+use crate::solve::{Solution, SolveConfig, SolveStatus, Solver, WbcError, solve_warm};
 use crate::task::Task;
 
 /// One named task inside a level.
@@ -72,7 +72,10 @@ impl LevelBuilder {
     /// Add a named task to this level. Any [`Task`] fits — from the
     /// [`crate::tasks`] catalogue, or hand-built.
     pub fn task(mut self, name: impl Into<String>, task: Task) -> Self {
-        self.entries.push(Entry { name: name.into(), task });
+        self.entries.push(Entry {
+            name: name.into(),
+            task,
+        });
         self
     }
 }
@@ -89,14 +92,24 @@ impl Stack {
     /// Start an empty stack over a variable layout (the layout fixes
     /// the decision-vector size every task must match).
     pub fn new(vars: &VarLayout) -> Self {
-        Stack { n_decision: vars.n_decision(), levels: Vec::new() }
+        Stack {
+            n_decision: vars.n_decision(),
+            levels: Vec::new(),
+        }
     }
 
     /// Append a priority level built by the closure. Levels are solved
     /// in the order they are added (first = highest priority).
-    pub fn level(mut self, name: impl Into<String>, build: impl FnOnce(LevelBuilder) -> LevelBuilder) -> Self {
+    pub fn level(
+        mut self,
+        name: impl Into<String>,
+        build: impl FnOnce(LevelBuilder) -> LevelBuilder,
+    ) -> Self {
         let b = build(LevelBuilder::default());
-        self.levels.push(Level { name: name.into(), entries: b.entries });
+        self.levels.push(Level {
+            name: name.into(),
+            entries: b.entries,
+        });
         self
     }
 
@@ -130,9 +143,16 @@ impl Stack {
 
     /// [`Stack::solve`] through a persistent [`Solver`] session, so the
     /// active-set backend warm-starts across ticks.
-    pub fn solve_with(&self, solver: &mut Solver, cfg: &SolveConfig) -> Result<StackSolution, WbcError> {
+    pub fn solve_with(
+        &self,
+        solver: &mut Solver,
+        cfg: &SolveConfig,
+    ) -> Result<StackSolution, WbcError> {
         let solution = solver.solve(&self.to_tasks(), cfg)?;
-        Ok(StackSolution { stack: self.clone(), solution })
+        Ok(StackSolution {
+            stack: self.clone(),
+            solution,
+        })
     }
 
     /// [`Stack::solve`] with a warm anchor (see [`crate::solve::solve_warm`]).
@@ -142,13 +162,21 @@ impl Stack {
         warm_anchor: Option<&DVector<f64>>,
     ) -> Result<StackSolution, WbcError> {
         let solution = solve_warm(&self.to_tasks(), cfg, warm_anchor)?;
-        Ok(StackSolution { stack: self.clone(), solution })
+        Ok(StackSolution {
+            stack: self.clone(),
+            solution,
+        })
     }
 }
 
 impl fmt::Display for Stack {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "stack ({} decision vars, {} levels)", self.n_decision, self.levels.len())?;
+        writeln!(
+            f,
+            "stack ({} decision vars, {} levels)",
+            self.n_decision,
+            self.levels.len()
+        )?;
         for (i, l) in self.levels.iter().enumerate() {
             writeln!(f, "  level {i} \"{}\"", l.name)?;
             for e in &l.entries {
@@ -203,16 +231,24 @@ impl StackSolution {
                     .entries
                     .iter()
                     .map(|e| {
-                        let eq_residual = (e.task.n_eq() > 0)
-                            .then(|| (&e.task.a * x - &e.task.b).norm());
+                        let eq_residual =
+                            (e.task.n_eq() > 0).then(|| (&e.task.a * x - &e.task.b).norm());
                         let iq_margin = (e.task.n_iq() > 0).then(|| {
                             let m = &e.task.f - &e.task.d * x;
                             m.min()
                         });
-                        TaskReport { name: e.name.clone(), eq_residual, iq_margin }
+                        TaskReport {
+                            name: e.name.clone(),
+                            eq_residual,
+                            iq_margin,
+                        }
                     })
                     .collect();
-                LevelReport { name: l.name.clone(), degraded, tasks }
+                LevelReport {
+                    name: l.name.clone(),
+                    degraded,
+                    tasks,
+                }
             })
             .collect();
         Report { levels }
@@ -298,7 +334,9 @@ mod tests {
                     ),
                 )
             })
-            .level("rest", |l| l.task("reg", tasks::regularize(&x, &DVector::zeros(2))));
+            .level("rest", |l| {
+                l.task("reg", tasks::regularize(&x, &DVector::zeros(2)))
+            });
         (vars, stack)
     }
 
@@ -321,7 +359,11 @@ mod tests {
         let report = sol.report();
         // The pinned equality is achieved…
         let pin = &report.levels[0].tasks[0];
-        assert!(pin.eq_residual.unwrap() < 1e-5, "pin residual {:?}", pin.eq_residual);
+        assert!(
+            pin.eq_residual.unwrap() < 1e-5,
+            "pin residual {:?}",
+            pin.eq_residual
+        );
         // …and the inequality has non-negative margin.
         let iq = &report.levels[0].tasks[1];
         assert!(iq.iq_margin.unwrap() >= -1e-9, "margin {:?}", iq.iq_margin);
@@ -335,6 +377,9 @@ mod tests {
         let (_, stack) = two_level();
         let via_stack = stack.solve(&SolveConfig::default()).unwrap();
         let raw = crate::solve::solve(&stack.to_tasks(), &SolveConfig::default()).unwrap();
-        assert!((&via_stack.x - &raw.x).norm() < 1e-12, "stack must be a pure veneer");
+        assert!(
+            (&via_stack.x - &raw.x).norm() < 1e-12,
+            "stack must be a pure veneer"
+        );
     }
 }

@@ -30,7 +30,9 @@
 
 use nalgebra::{DMatrix, DVector};
 
-use crate::qp::{solve_qp, solve_qp_warm, QpConfig, QpSolver, QpStatus, QpWorkspace};
+use crate::qp::{
+    QpConfig, QpDiagnostics, QpSolution, QpSolver, QpStatus, QpWorkspace, solve_qp, solve_qp_warm,
+};
 
 use crate::task::Task;
 
@@ -55,6 +57,21 @@ struct LevelState {
     stacked_slack: DVector<f64>,
 }
 
+/// Exact assembled inner problem, including actual slack variables.
+/// Captured only by the opt-in diagnostic constructor.
+#[derive(Clone, Debug)]
+pub struct InnerQpSnapshot {
+    pub h: DMatrix<f64>,
+    pub c: DVector<f64>,
+    pub a_iq: DMatrix<f64>,
+    pub b_iq: DVector<f64>,
+    pub n_velocity: usize,
+    pub raw_solution: QpSolution,
+    pub assembly_ns: u128,
+    pub solve_ns: u128,
+    pub postprocess_ns: u128,
+}
+
 #[derive(Clone, Debug)]
 pub struct HoQp {
     state: LevelState,
@@ -67,6 +84,9 @@ pub struct HoQp {
     /// healthy tick; a non-optimal value means this level (and the
     /// levels below it) degraded — surfaced by the `solve` wrapper.
     status: QpStatus,
+    level_statuses: Vec<QpStatus>,
+    inner_snapshot: Option<InnerQpSnapshot>,
+    diagnostics: Option<QpDiagnostics>,
 }
 
 /// Default inner-QP config for the HoQP: the interior-point Clarabel
@@ -133,11 +153,7 @@ impl HoQp {
 
     /// Like [`HoQp::new_with_higher`] but with a warm-start hint,
     /// default backend. See [`WarmStart`].
-    pub fn new_with_higher_warm(
-        task: Task,
-        higher: Option<&HoQp>,
-        warm: &WarmStart<'_>,
-    ) -> Self {
+    pub fn new_with_higher_warm(task: Task, higher: Option<&HoQp>, warm: &WarmStart<'_>) -> Self {
         Self::new_with_cfg(task, higher, warm, &hoqp_default_qp_cfg())
     }
 
@@ -165,6 +181,39 @@ impl HoQp {
         qp_cfg: &QpConfig,
         workspace: Option<&mut QpWorkspace>,
     ) -> Self {
+        Self::new_with_cfg_ws_capture(task, higher, warm, qp_cfg, workspace, false)
+    }
+
+    /// Diagnostic constructor. Snapshot cloning happens outside measured solve time.
+    pub fn new_with_cfg_ws_capture(
+        task: Task,
+        higher: Option<&HoQp>,
+        warm: &WarmStart<'_>,
+        qp_cfg: &QpConfig,
+        workspace: Option<&mut QpWorkspace>,
+        capture: bool,
+    ) -> Self {
+        Self::new_with_cfg_ws_checked(task, higher, warm, qp_cfg, workspace, capture, None)
+    }
+
+    /// Optional independent KKT and strict raw-status validation before using a step.
+    /// Validation does not retain problem matrices and requires zero objective prox.
+    pub fn new_with_cfg_ws_checked(
+        task: Task,
+        higher: Option<&HoQp>,
+        warm: &WarmStart<'_>,
+        qp_cfg: &QpConfig,
+        mut workspace: Option<&mut QpWorkspace>,
+        capture: bool,
+        validation_tol: Option<f64>,
+    ) -> Self {
+        if let Some(tol) = validation_tol {
+            assert!(
+                tol.is_finite() && tol > 0. && warm.prox_weight == 0.,
+                "checked HQP requires positive finite tolerance and zero prox_weight"
+            );
+        }
+        let assembly_start = capture.then(std::time::Instant::now);
         let (n_decision_total, prev) = match higher {
             Some(h) => (h.state.x.len(), h.state.clone()),
             None => {
@@ -190,10 +239,13 @@ impl HoQp {
         );
 
         let n_v = prev.z.ncols(); // dimension we may still optimise over
-        let n_slack = task.n_iq();
+        let n_iq = task.n_iq();
+        let hard_current =
+            qp_cfg.hard_first_inequalities && n_iq > 0 && prev.stacked_d.nrows() == 0;
+        let n_slack = if hard_current { 0 } else { n_iq };
         let n_prev_slack = prev.stacked_slack.len();
         let has_eq = task.n_eq() > 0;
-        let has_iq = n_slack > 0;
+        let has_iq = n_iq > 0;
 
         // ── Build the per-level QP: variables y = [v; w] ─────────────
         let n_y = n_v + n_slack;
@@ -235,7 +287,7 @@ impl HoQp {
         //   1) -w  ≤ 0                         (slack non-negativity)
         //   2) D_{<k} Z_prev v ≤ f_{<k} - D_{<k} x_prev + w_{<k}
         //   3) D_k    Z_prev v - w ≤ f_k - D_k x_prev
-        let m_total = n_slack + n_prev_slack + n_slack;
+        let m_total = n_slack + n_prev_slack + n_iq;
         let mut d_total = DMatrix::zeros(m_total, n_y);
         let mut f_total = DVector::zeros(m_total);
         let mut row = 0usize;
@@ -260,17 +312,15 @@ impl HoQp {
             row += n_prev_slack;
         }
 
-        // Group 3: current-level inequalities with slack.
+        // Group 3: first physical level can be exact; later rows retain slack.
         if has_iq {
             let d_z = &task.d * &prev.z;
-            d_total
-                .view_mut((row, 0), (n_slack, n_v))
-                .copy_from(&d_z);
+            d_total.view_mut((row, 0), (n_iq, n_v)).copy_from(&d_z);
             for i in 0..n_slack {
                 d_total[(row + i, n_v + i)] = -1.0;
             }
             let rhs = &task.f - &task.d * &prev.x;
-            f_total.view_mut((row, 0), (n_slack, 1)).copy_from(&rhs);
+            f_total.view_mut((row, 0), (n_iq, 1)).copy_from(&rhs);
         }
 
         // Solve the inner QP. Use Clarabel via the internal qp — robust on the
@@ -283,28 +333,27 @@ impl HoQp {
         // anchoring the inner optimum toward `(v_target, 0_slack)`.
         // Re-projecting every tick keeps the anchor valid even though
         // `prev.z` is rebuilt from a `q`-dependent equality matrix.
-        let warm_y_owned: Option<DVector<f64>> =
-            if warm.prox_weight > 0.0 && n_y > 0 {
-                warm.x_prev.and_then(|x_prev| {
-                    if x_prev.len() != n_decision_total {
-                        return None;
+        let warm_y_owned: Option<DVector<f64>> = if warm.prox_weight > 0.0 && n_y > 0 {
+            warm.x_prev.and_then(|x_prev| {
+                if x_prev.len() != n_decision_total {
+                    return None;
+                }
+                let mut y = DVector::zeros(n_y);
+                if n_v > 0 {
+                    let delta = x_prev - &prev.x;
+                    let v_target = prev.z.transpose() * delta;
+                    for i in 0..n_v {
+                        y[i] = v_target[i];
                     }
-                    let mut y = DVector::zeros(n_y);
-                    if n_v > 0 {
-                        let delta = x_prev - &prev.x;
-                        let v_target = prev.z.transpose() * delta;
-                        for i in 0..n_v {
-                            y[i] = v_target[i];
-                        }
-                    }
-                    // Slack rows stay at 0 — a converged WBC has slack ≈ 0
-                    // and we don't want to anchor toward a transient
-                    // violation from the previous tick.
-                    Some(y)
-                })
-            } else {
-                None
-            };
+                }
+                // Slack rows stay at 0 — a converged WBC has slack ≈ 0
+                // and we don't want to anchor toward a transient
+                // violation from the previous tick.
+                Some(y)
+            })
+        } else {
+            None
+        };
         // Inherit the caller's backend + tolerances; the prox weight is
         // driven by the per-level warm-start projection, not the config.
         let cfg = QpConfig {
@@ -317,7 +366,9 @@ impl HoQp {
         };
         let qp_a_iq = (m_total > 0).then(|| d_total.clone());
         let qp_b_iq = (m_total > 0).then(|| f_total.clone());
-        let sol = match workspace {
+        let assembly_ns = assembly_start.map_or(0, |t| t.elapsed().as_nanos());
+        let solve_start = capture.then(std::time::Instant::now);
+        let mut sol = match workspace.as_deref_mut() {
             Some(ws) => solve_qp_warm(
                 &h,
                 &c,
@@ -340,6 +391,33 @@ impl HoQp {
                 &cfg,
             ),
         };
+        let solve_ns = solve_start.map_or(0, |t| t.elapsed().as_nanos());
+        if let Some(tol) = validation_tol {
+            if !sol.formally_solved()
+                || !crate::qp_check::check(&h, &c, None, Some((&d_total, &f_total)), &sol)
+                    .accepted(tol)
+            {
+                if sol.status == QpStatus::Optimal {
+                    sol.status = QpStatus::NumericalFailure;
+                }
+                if let Some(ws) = workspace {
+                    ws.clear();
+                }
+            }
+        }
+        let mut inner_snapshot = capture.then(|| InnerQpSnapshot {
+            h,
+            c,
+            a_iq: d_total,
+            b_iq: f_total,
+            n_velocity: n_v,
+            raw_solution: sol.clone(),
+            assembly_ns,
+            solve_ns,
+            postprocess_ns: 0,
+        });
+        let mut level_statuses = higher.map(|h| h.level_statuses.clone()).unwrap_or_default();
+        level_statuses.push(sol.status);
         if !matches!(sol.status, QpStatus::Optimal) {
             // The status also propagates to the returned solution, so a
             // host with a logging facade can surface it there. We keep
@@ -351,17 +429,22 @@ impl HoQp {
             );
         }
 
+        let postprocess_start = capture.then(std::time::Instant::now);
         // Extract `v` and `w` from the solver result. If the QP failed
         // we still return `state.x = prev.x` (no progress) so the
         // overall WBC degrades gracefully rather than panicking.
         let (v_step, slack_curr, y_full) = if matches!(sol.status, QpStatus::Optimal) {
             let v = sol.x.rows(0, n_v).into_owned();
-            let w = sol.x.rows(n_v, n_slack).into_owned();
+            let w = if hard_current {
+                DVector::zeros(n_iq)
+            } else {
+                sol.x.rows(n_v, n_slack).into_owned()
+            };
             (v, w, sol.x.clone())
         } else {
             (
                 DVector::zeros(n_v),
-                DVector::zeros(n_slack),
+                DVector::zeros(n_iq),
                 DVector::zeros(n_y),
             )
         };
@@ -390,6 +473,9 @@ impl HoQp {
         let stacked_f = stack_vec(&prev.stacked_f, &task.f);
         let stacked_slack = stack_vec(&prev.stacked_slack, &slack_curr);
 
+        if let Some(snapshot) = &mut inner_snapshot {
+            snapshot.postprocess_ns = postprocess_start.map_or(0, |t| t.elapsed().as_nanos());
+        }
         Self {
             state: LevelState {
                 x: x_new,
@@ -399,8 +485,25 @@ impl HoQp {
                 stacked_slack,
             },
             y_solution: y_full,
+            diagnostics: sol.diagnostics.clone(),
             status: sol.status,
+            level_statuses,
+            inner_snapshot,
         }
+    }
+
+    /// Raw backend diagnostics for this layer, without retaining matrices.
+    pub fn diagnostics(&self) -> Option<&QpDiagnostics> {
+        self.diagnostics.as_ref()
+    }
+
+    /// Status of every inner solve, including failures above this layer.
+    pub fn level_statuses(&self) -> &[QpStatus] {
+        &self.level_statuses
+    }
+
+    pub fn inner_snapshot(&self) -> Option<&InnerQpSnapshot> {
+        self.inner_snapshot.as_ref()
     }
 
     /// Final solution `x` after all levels.
@@ -508,7 +611,8 @@ fn stack_rows(m1: &DMatrix<f64>, m2: &DMatrix<f64>, ncols: usize) -> DMatrix<f64
     }
     let mut out = DMatrix::zeros(m1.nrows() + m2.nrows(), ncols);
     out.view_mut((0, 0), (m1.nrows(), ncols)).copy_from(m1);
-    out.view_mut((m1.nrows(), 0), (m2.nrows(), ncols)).copy_from(m2);
+    out.view_mut((m1.nrows(), 0), (m2.nrows(), ncols))
+        .copy_from(m2);
     out
 }
 
@@ -641,14 +745,9 @@ mod tests {
             x_prev: Some(&x_prev),
             prox_weight: 0.0,
         };
-        let warm_sol =
-            HoQp::new_with_higher_warm(Task::equality(a, b), None, &warm);
+        let warm_sol = HoQp::new_with_higher_warm(Task::equality(a, b), None, &warm);
         for i in 0..2 {
-            assert_relative_eq!(
-                cold.solution()[i],
-                warm_sol.solution()[i],
-                epsilon = 1e-6,
-            );
+            assert_relative_eq!(cold.solution()[i], warm_sol.solution()[i], epsilon = 1e-6,);
         }
     }
 
@@ -670,5 +769,97 @@ mod tests {
         let l1 = HoQp::new_with_higher(task_1, Some(&l0));
         assert_relative_eq!(l1.solution()[0], 2.0, epsilon = 1e-6);
         assert_relative_eq!(l1.solution()[1], 5.0, epsilon = 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    #[test]
+    fn snapshot_is_opt_in_and_includes_slack() {
+        let task = Task {
+            a: DMatrix::identity(1, 1),
+            b: DVector::from_element(1, 2.),
+            d: DMatrix::identity(1, 1),
+            f: DVector::from_element(1, 1.),
+        };
+        assert!(HoQp::new(task.clone()).inner_snapshot().is_none());
+        let h = HoQp::new_with_cfg_ws_capture(
+            task,
+            None,
+            &WarmStart::COLD,
+            &hoqp_default_qp_cfg(),
+            None,
+            true,
+        );
+        let q = h.inner_snapshot().unwrap();
+        assert_eq!(q.h.nrows(), 2);
+        assert_eq!(q.n_velocity, 1);
+        assert_eq!(q.a_iq.nrows(), 2);
+        assert!((q.raw_solution.x[1] - 0.5).abs() < 1e-5);
+        assert_eq!(h.level_statuses(), &[h.status()]);
+    }
+    #[test]
+    fn hard_first_inequalities_have_no_slack_and_survive_lower_levels() {
+        let task = Task {
+            a: DMatrix::identity(1, 1),
+            b: DVector::from_element(1, 2.0),
+            d: DMatrix::identity(1, 1),
+            f: DVector::from_element(1, 1.0),
+        };
+        let cfg = QpConfig {
+            hard_first_inequalities: true,
+            absolute_gap: true,
+            ..hoqp_default_qp_cfg()
+        };
+        let upper = HoQp::new_with_cfg_ws_capture(task, None, &WarmStart::COLD, &cfg, None, true);
+        assert_eq!(upper.status(), QpStatus::Optimal);
+        assert!(upper.solution()[0] <= 1.0 + 1e-8);
+        assert_eq!(upper.inner_snapshot().unwrap().h.nrows(), 1);
+        assert_eq!(upper.inner_snapshot().unwrap().a_iq.nrows(), 1);
+        let lower = HoQp::new_with_cfg(
+            Task::equality(DMatrix::identity(1, 1), DVector::from_element(1, 5.0)),
+            Some(&upper),
+            &WarmStart::COLD,
+            &cfg,
+        );
+        assert_eq!(lower.status(), QpStatus::Optimal);
+        assert!(lower.solution()[0] <= 1.0 + 1e-8);
+    }
+
+    #[test]
+    fn hard_first_infeasible_inequalities_do_not_apply_a_relaxed_solution() {
+        let task = Task::inequality(
+            DMatrix::from_row_slice(2, 1, &[1.0, -1.0]),
+            DVector::from_vec(vec![0.0, -1.0]),
+        );
+        let cfg = QpConfig {
+            hard_first_inequalities: true,
+            absolute_gap: true,
+            ..hoqp_default_qp_cfg()
+        };
+        let solution = HoQp::new_with_cfg(task, None, &WarmStart::COLD, &cfg);
+        assert_ne!(solution.status(), QpStatus::Optimal);
+        assert_eq!(solution.solution()[0], 0.0);
+    }
+
+    #[test]
+    fn earlier_layer_failure_is_retained_in_diagnostics() {
+        let task = Task {
+            a: DMatrix::identity(1, 1),
+            b: DVector::from_element(1, 2.),
+            d: DMatrix::identity(1, 1),
+            f: DVector::from_element(1, 1.),
+        };
+        let cfg = QpConfig {
+            solver: QpSolver::ActiveSet,
+            max_iters: 0,
+            ..Default::default()
+        };
+        let upper = HoQp::new_with_cfg(task.clone(), None, &WarmStart::COLD, &cfg);
+        let lower = HoQp::new_with_higher(task, Some(&upper));
+        assert_ne!(upper.status(), QpStatus::Optimal);
+        assert_eq!(lower.level_statuses()[0], upper.status());
+        assert_eq!(lower.level_statuses().len(), 2);
     }
 }

@@ -13,11 +13,10 @@
 //! with those tasks when they land (Phase 3+), since they need a robot
 //! model to produce Jacobians.
 
-
 // Under --no-default-features only the non-Clarabel tests remain;
 // the shared fixtures/imports above them would trip -D warnings.
 #![cfg_attr(not(feature = "clarabel"), allow(unused))]
-use misa_wbc::{solve, HqpStrategy, SolveConfig, SolveStatus, Task, VarLayout, WbcError};
+use misa_wbc::{HqpStrategy, SolveConfig, SolveStatus, Task, VarLayout, WbcError, solve};
 use nalgebra::{DMatrix, DVector};
 
 // A fixed-seed LCG so the randomised checks are deterministic across
@@ -29,7 +28,10 @@ impl Lcg {
     }
     fn next_f64(&mut self) -> f64 {
         // Numerical Recipes LCG, mapped to [-1, 1).
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
     fn matrix(&mut self, r: usize, c: usize) -> DMatrix<f64> {
@@ -170,8 +172,7 @@ fn infeasible_inequalities_absorbed_by_slack() {
     let d_ge = DMatrix::from_row_slice(1, 1, &[-1.0]);
     let level = Task::inequality(d_le, DVector::from_vec(vec![-1.0]))
         + Task::inequality(d_ge, DVector::from_vec(vec![-1.0]));
-    let sol = solve(&[level], &SolveConfig::default())
-        .expect("slack keeps the inner QP feasible");
+    let sol = solve(&[level], &SolveConfig::default()).expect("slack keeps the inner QP feasible");
     assert_eq!(sol.status, SolveStatus::Optimal, "slack should absorb it");
     // The compromise sits between the two bounds (near 0 by symmetry).
     assert!(sol.x[0].abs() < 1.0 + 1e-6, "compromise x = {}", sol.x[0]);
@@ -210,13 +211,19 @@ fn backends_agree() {
         let levels = vec![Task::equality(a, b)];
         let x_clara = solve(
             &levels,
-            &SolveConfig { backend: QpSolver::Clarabel, ..Default::default() },
+            &SolveConfig {
+                backend: QpSolver::Clarabel,
+                ..Default::default()
+            },
         )
         .unwrap()
         .x;
         let x_as = solve(
             &levels,
-            &SolveConfig { backend: QpSolver::ActiveSet, ..Default::default() },
+            &SolveConfig {
+                backend: QpSolver::ActiveSet,
+                ..Default::default()
+            },
         )
         .unwrap()
         .x;

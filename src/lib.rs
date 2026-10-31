@@ -65,6 +65,7 @@ pub mod dims;
 pub mod dynamics;
 pub mod ho_qp;
 pub mod qp;
+pub mod qp_check;
 pub mod refgen;
 pub mod solve;
 pub mod stack;
@@ -74,11 +75,13 @@ pub mod tasks;
 pub use affine::{Affine, AsAffine, Var, VarLayout, VarLayoutBuilder};
 pub use dims::WbcDims;
 pub use dynamics::{Dynamics, Extracted, Formulation};
-pub use stack::{Stack, StackSolution};
 pub use ho_qp::{HoQp, WarmStart};
-pub use qp::{solve_qp, solve_qp_warm, QpConfig, QpSolution, QpSolver, QpStatus, QpWorkspace};
+pub use qp::{QpConfig, QpSolution, QpSolver, QpStatus, QpWorkspace, solve_qp, solve_qp_warm};
 pub use solve::{
-    solve, solve_warm, HqpStrategy, Solution, SolveConfig, SolveStatus, WbcError,
- Solver};
+    HqpStrategy, Solution, SolveConfig, SolveStatus, Solver, WbcError, solve, solve_warm,
+};
+pub use stack::{Stack, StackSolution};
 pub use task::Task;
 pub use tasks::ContactPatch;
+
+pub mod ocp;

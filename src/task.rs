@@ -141,11 +141,7 @@ impl Task {
 
     /// Hard double-sided inequality `lb ≤ expr ≤ ub` (the `le` and `ge`
     /// rows concatenated).
-    pub fn in_range(
-        lb: &DVector<f64>,
-        expr: &crate::affine::Affine,
-        ub: &DVector<f64>,
-    ) -> Task {
+    pub fn in_range(lb: &DVector<f64>, expr: &crate::affine::Affine, ub: &DVector<f64>) -> Task {
         Task::le(expr, ub) + Task::ge(expr, lb)
     }
 }
@@ -185,7 +181,8 @@ fn stack_rows(m1: &DMatrix<f64>, m2: &DMatrix<f64>, ncols: usize) -> DMatrix<f64
     }
     let mut out = DMatrix::zeros(m1.nrows() + m2.nrows(), ncols);
     out.view_mut((0, 0), (m1.nrows(), ncols)).copy_from(m1);
-    out.view_mut((m1.nrows(), 0), (m2.nrows(), ncols)).copy_from(m2);
+    out.view_mut((m1.nrows(), 0), (m2.nrows(), ncols))
+        .copy_from(m2);
     out
 }
 

@@ -19,15 +19,15 @@ use std::time::Instant;
 
 use misa_wbc::qp::QpSolver;
 use misa_wbc::{
-    solve, tasks, Dynamics, Extracted, Formulation, HqpStrategy, SolveConfig, SolveStatus, Task,
+    Dynamics, Extracted, Formulation, HqpStrategy, SolveConfig, SolveStatus, Task, solve, tasks,
 };
 use nalgebra::{DMatrix, DVector};
 
 fn main() {
     // ── Load the real model ─────────────────────────────────────────
     let path = format!("{}/examples/models/panda.urdf", env!("CARGO_MANIFEST_DIR"));
-    let imported = misarta_formats::urdf::import(std::path::Path::new(&path))
-        .expect("import panda.urdf");
+    let imported =
+        misarta_formats::urdf::import(std::path::Path::new(&path)).expect("import panda.urdf");
     let (model, _vis, _col) =
         misarta::native::build_model(&imported.file).expect("build panda model");
     let (nv, nq) = (model.nv, model.nq);
@@ -61,7 +61,10 @@ fn main() {
 
     // Panda joint torque limits (7 arm joints; finger joints get 20 N).
     let mut tau_max = DVector::from_element(na, 20.0);
-    for (i, &t) in [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0].iter().enumerate() {
+    for (i, &t) in [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
+        .iter()
+        .enumerate()
+    {
         tau_max[i] = t;
     }
 
@@ -83,10 +86,19 @@ fn main() {
     };
 
     // ── Sweep ───────────────────────────────────────────────────────
-    let formulations = [Formulation::Explicit, Formulation::AccelSpace, Formulation::ForceSpace];
-    let strategies =
-        [(HqpStrategy::NullSpace, "NullSpace"), (HqpStrategy::ForceBudgetCascade, "ForceBudget")];
-    let backends = [(QpSolver::Clarabel, "Clarabel"), (QpSolver::ActiveSet, "ActiveSet")];
+    let formulations = [
+        Formulation::Explicit,
+        Formulation::AccelSpace,
+        Formulation::ForceSpace,
+    ];
+    let strategies = [
+        (HqpStrategy::NullSpace, "NullSpace"),
+        (HqpStrategy::ForceBudgetCascade, "ForceBudget"),
+    ];
+    let backends = [
+        (QpSolver::Clarabel, "Clarabel"),
+        (QpSolver::ActiveSet, "ActiveSet"),
+    ];
 
     const WARMUP: usize = 5;
     const RUNS: usize = 50;
@@ -114,7 +126,11 @@ fn main() {
         let levels = stack(&d);
         for (strategy, sname) in strategies {
             for (backend, bname) in backends {
-                let cfg = SolveConfig { strategy, backend, ..Default::default() };
+                let cfg = SolveConfig {
+                    strategy,
+                    backend,
+                    ..Default::default()
+                };
 
                 let mut times = Vec::with_capacity(RUNS);
                 let mut last = None;

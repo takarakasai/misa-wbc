@@ -42,14 +42,17 @@
 
 use std::time::Instant;
 
-use misa_wbc::qp::{solve_qp, QpConfig, QpSolver, QpStatus};
+use misa_wbc::qp::{QpConfig, QpSolver, QpStatus, solve_qp};
 use nalgebra::{DMatrix, DVector};
 
 /// Deterministic LCG so the sweep is reproducible without a `rand` dep.
 struct Lcg(u64);
 impl Lcg {
     fn next_f64(&mut self) -> f64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
 }
@@ -108,8 +111,11 @@ fn main() {
     println!("|{}|", "-".repeat(103));
 
     for &n in &SIZES {
-        let ipm_cfg =
-            QpConfig { solver: QpSolver::Ipm, max_iters: as_max_iters_for(n), ..Default::default() };
+        let ipm_cfg = QpConfig {
+            solver: QpSolver::Ipm,
+            max_iters: as_max_iters_for(n),
+            ..Default::default()
+        };
         let as_cfg = QpConfig {
             solver: QpSolver::ActiveSet,
             max_iters: as_max_iters_for(n),
@@ -136,7 +142,11 @@ fn main() {
             let t0 = Instant::now();
             let sol_as = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &as_cfg);
             as_times.push(t0.elapsed().as_secs_f64() * 1e3);
-            assert_eq!(sol_as.status, QpStatus::Optimal, "ActiveSet failed at n={n}");
+            assert_eq!(
+                sol_as.status,
+                QpStatus::Optimal,
+                "ActiveSet failed at n={n}"
+            );
             as_iters.push(sol_as.iterations);
         }
 

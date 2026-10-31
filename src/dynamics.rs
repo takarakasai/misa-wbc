@@ -162,7 +162,13 @@ impl Dynamics {
                 let residual_u = &(&(&m_u * &q) - &(&jct_u * &f)) + &h_u;
                 let physics = (n_base > 0).then(|| Task::soft_eq(&residual_u));
 
-                Dynamics { formulation, qddot: q.affine(), tau, physics, layout }
+                Dynamics {
+                    formulation,
+                    qddot: q.affine(),
+                    tau,
+                    physics,
+                    layout,
+                }
             }
             Formulation::ForceSpace => {
                 let layout = VarLayout::builder().add("tau", na).add("f", nf).build();
@@ -184,7 +190,13 @@ impl Dynamics {
 
                 let qddot = &(&(&minv_st * &t) + &(&minv_jct * &f)) - &minv_h;
 
-                Dynamics { formulation, qddot, tau: t.affine(), physics: None, layout }
+                Dynamics {
+                    formulation,
+                    qddot,
+                    tau: t.affine(),
+                    physics: None,
+                    layout,
+                }
             }
         }
     }
@@ -280,7 +292,11 @@ mod tests {
         let x = probe(d.layout().n_decision());
         let e = d.extract(&x);
         let r = &mass * &e.qddot + &h - &s_t * &e.tau - jc.transpose() * &e.forces;
-        assert!(r.norm() < 1e-10, "ForceSpace EoM identity violated: {}", r.norm());
+        assert!(
+            r.norm() < 1e-10,
+            "ForceSpace EoM identity violated: {}",
+            r.norm()
+        );
 
         // AccelSpace: the actuated rows must hold for every x (τ is
         // defined by them); the base rows are the remaining task.
@@ -345,6 +361,9 @@ mod tests {
         let t_exp = crate::tasks::cartesian_acceleration(de.qddot(), &j_task, &dj_v, &aref);
         let re = &t_exp.a * &xe - &t_exp.b;
 
-        assert!((rf - re).norm() < 1e-10, "task residuals differ across formulations");
+        assert!(
+            (rf - re).norm() < 1e-10,
+            "task residuals differ across formulations"
+        );
     }
 }

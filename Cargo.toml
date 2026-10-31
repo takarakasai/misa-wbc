@@ -25,3 +25,12 @@ approx = "0.5"
 # solver (enough for the standalone `qp` module, not the HoQP).
 default = ["clarabel"]
 clarabel = ["dep:clarabel"]
+proxqp = []
+eiquadprog = []
+qpoases = []
+osqp = []
+hpipm = []
+native-all = ["proxqp", "eiquadprog", "qpoases", "osqp", "hpipm"]
+
+[build-dependencies]
+cc = "=1.2.60"

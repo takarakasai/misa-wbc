@@ -32,7 +32,7 @@ use misarta::fk::forward_kinematics;
 use misarta::jacobian::{compute_jacobian_dot_times_v, compute_joint_jacobian};
 use misarta::se3;
 
-use misa_wbc::{refgen, tasks, Dynamics, Formulation, QpSolver, SolveConfig, Solver};
+use misa_wbc::{Dynamics, Formulation, QpSolver, SolveConfig, Solver, refgen, tasks};
 use nalgebra::{DMatrix, DVector, Vector3};
 
 const DT: f64 = 0.004; // 250 Hz
@@ -65,11 +65,16 @@ fn main() {
     let formulation = parse_formulation(args.get(1).map(|s| s.as_str()).unwrap_or("explicit"));
     let backend = parse_backend(args.get(2).map(|s| s.as_str()).unwrap_or("activeset"));
     let damped = args.get(3).map(|s| s.as_str()) == Some("damped");
-    eprintln!("formulation={:?} backend={:?} damped={damped}", formulation, backend);
+    eprintln!(
+        "formulation={:?} backend={:?} damped={damped}",
+        formulation, backend
+    );
 
     let path = format!("{}/examples/models/panda.urdf", env!("CARGO_MANIFEST_DIR"));
-    let imported = misarta_formats::urdf::import(std::path::Path::new(&path)).expect("import panda.urdf");
-    let (model, _vis, _col) = misarta::native::build_model(&imported.file).expect("build panda model");
+    let imported =
+        misarta_formats::urdf::import(std::path::Path::new(&path)).expect("import panda.urdf");
+    let (model, _vis, _col) =
+        misarta::native::build_model(&imported.file).expect("build panda model");
     let (nv, nq) = (model.nv, model.nq);
     assert_eq!(nq, nv, "fixed-base arm expected");
     let na = nv;
@@ -88,7 +93,10 @@ fn main() {
     let mut v = vec![0.0_f64; nv];
 
     let mut tau_max = DVector::from_element(na, 20.0);
-    for (i, &t) in [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0].iter().enumerate() {
+    for (i, &t) in [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
+        .iter()
+        .enumerate()
+    {
         tau_max[i] = t;
     }
     let kp = DVector::from_element(6, 400.0);
@@ -105,7 +113,10 @@ fn main() {
     let ee0 = se3::translation(&data0.oMi[ee_idx]);
     let dir = (ee0 - shoulder).normalize();
 
-    let cfg = SolveConfig { backend, ..SolveConfig::default() }; // strategy: NullSpace (default)
+    let cfg = SolveConfig {
+        backend,
+        ..SolveConfig::default()
+    }; // strategy: NullSpace (default)
     let mut solver = Solver::new();
 
     let n_ticks = (DURATION_S / DT) as usize;
@@ -130,7 +141,11 @@ fn main() {
         // the reach-boundary singularity, continuously.
         let j_lin = j_ee.rows(3, 3).into_owned();
         let svd = nalgebra::linalg::SVD::new(j_lin, false, false);
-        let sigma_min = svd.singular_values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let sigma_min = svd
+            .singular_values
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
 
         let data = forward_kinematics(&model, &q);
         let ee_pos = se3::translation(&data.oMi[ee_idx]);
@@ -193,8 +208,13 @@ fn main() {
         // 1e3 rad / rad-s^-1 is already ~300x past any real joint limit
         // or plausible velocity for this arm -- only genuine blow-up
         // trips it.
-        if q.iter().chain(v.iter()).any(|x| !x.is_finite() || x.abs() > 1e3) {
-            eprintln!("STATE DIVERGED at tick {tick} (t={t:.4}s) -- stopping early, trace truncated here");
+        if q.iter()
+            .chain(v.iter())
+            .any(|x| !x.is_finite() || x.abs() > 1e3)
+        {
+            eprintln!(
+                "STATE DIVERGED at tick {tick} (t={t:.4}s) -- stopping early, trace truncated here"
+            );
             break;
         }
 
@@ -214,7 +234,9 @@ fn main() {
                 }
             }
         }
-        print!(",{sigma_min:.6},{tau_norm:.5},{tau_max_abs:.5},{qddot_norm:.5},{status_code},{degraded_level}");
+        print!(
+            ",{sigma_min:.6},{tau_norm:.5},{tau_max_abs:.5},{qddot_norm:.5},{status_code},{degraded_level}"
+        );
         println!();
     }
 }

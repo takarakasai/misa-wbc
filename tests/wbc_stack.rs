@@ -10,13 +10,20 @@
 #![cfg(feature = "clarabel")]
 
 use misa_wbc::tasks;
-use misa_wbc::{solve, SolveConfig, SolveStatus, VarLayout};
+use misa_wbc::{SolveConfig, SolveStatus, VarLayout, solve};
 use nalgebra::{DMatrix, DVector};
 
 /// A tiny consistent floating-base system: nv = 8 (6 base + 2 actuated),
 /// one 3-D point contact, na = 2. `M = I`, gravity-only `h`, a contact
 /// Jacobian whose base block is identity (so the foot senses base motion).
-fn toy_system() -> (usize, usize, usize, DMatrix<f64>, DVector<f64>, DMatrix<f64>) {
+fn toy_system() -> (
+    usize,
+    usize,
+    usize,
+    DMatrix<f64>,
+    DVector<f64>,
+    DMatrix<f64>,
+) {
     let (nv, nc, na) = (8usize, 1usize, 2usize);
     let mass = DMatrix::<f64>::identity(nv, nv);
     // gravity term on the base z row and both joints.

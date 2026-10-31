@@ -11,10 +11,8 @@
 
 #![cfg(feature = "clarabel")]
 
-use misa_wbc::qp::{solve_qp, QpConfig, QpSolver};
-use misa_wbc::{
-    solve, tasks, Dynamics, Formulation, HqpStrategy, SolveConfig, SolveStatus, Task,
-};
+use misa_wbc::qp::{QpConfig, QpSolver, solve_qp};
+use misa_wbc::{Dynamics, Formulation, HqpStrategy, SolveConfig, SolveStatus, Task, solve, tasks};
 use nalgebra::{DMatrix, DVector};
 
 /// A small consistent floating-base system with a non-trivial SPD mass
@@ -56,11 +54,12 @@ fn stack(d: &Dynamics, nv: usize, na: usize, jc: &DMatrix<f64>) -> Vec<Task> {
     for i in 0..3 {
         j_base[(i, i)] = 1.0;
     }
-    let p1 = tasks::cartesian_acceleration(d.qddot(), &j_base, &DVector::zeros(3), &DVector::zeros(3))
-        + tasks::regularize(&f, &DVector::from_vec(vec![0.0, 0.0, 5.0]));
+    let p1 =
+        tasks::cartesian_acceleration(d.qddot(), &j_base, &DVector::zeros(3), &DVector::zeros(3))
+            + tasks::regularize(&f, &DVector::from_vec(vec![0.0, 0.0, 5.0]));
 
-    let p2 = tasks::track(d.qddot(), &DVector::zeros(nv))
-        + tasks::track(d.tau(), &DVector::zeros(na));
+    let p2 =
+        tasks::track(d.qddot(), &DVector::zeros(nv)) + tasks::track(d.tau(), &DVector::zeros(na));
 
     vec![p0, p1, p2]
 }
@@ -78,7 +77,11 @@ fn formulations_agree_on_the_physical_solution() {
     let cfg = SolveConfig::default();
 
     let mut results = Vec::new();
-    for formulation in [Formulation::Explicit, Formulation::AccelSpace, Formulation::ForceSpace] {
+    for formulation in [
+        Formulation::Explicit,
+        Formulation::AccelSpace,
+        Formulation::ForceSpace,
+    ] {
         let d = Dynamics::new(formulation, &mass, &h, &jc, na);
         let sol = solve(&stack(&d, nv, na, &jc), &cfg).expect("solve");
         assert_eq!(sol.status, SolveStatus::Optimal, "{formulation:?} degraded");
@@ -86,9 +89,16 @@ fn formulations_agree_on_the_physical_solution() {
 
         // Physics holds in every formulation.
         let eom = &mass * &e.qddot + &h - &s_t * &e.tau - jc.transpose() * &e.forces;
-        assert!(eom.norm() < 1e-5, "{formulation:?}: EoM residual {}", eom.norm());
+        assert!(
+            eom.norm() < 1e-5,
+            "{formulation:?}: EoM residual {}",
+            eom.norm()
+        );
         // Contact holds still.
-        assert!((&jc * &e.qddot).norm() < 1e-5, "{formulation:?}: contact accelerates");
+        assert!(
+            (&jc * &e.qddot).norm() < 1e-5,
+            "{formulation:?}: contact accelerates"
+        );
 
         results.push((formulation, e));
     }
@@ -187,7 +197,10 @@ fn force_space_budget_matches_hand_built_gid_qp() {
         Some(&d_iq),
         Some(&f_iq),
         None,
-        &QpConfig { solver: QpSolver::Clarabel, ..Default::default() },
+        &QpConfig {
+            solver: QpSolver::Clarabel,
+            ..Default::default()
+        },
     );
     assert!(
         (&ours - &manual.x).norm() < 1e-5,
@@ -224,10 +237,16 @@ fn budget_cascade_is_greedy_null_space_is_strict() {
     };
     let x_greedy = solve(&levels, &budget).unwrap().x[0];
     // Greedy: L1 pulls x from 2 up to the constraint boundary 3.
-    assert!((x_greedy - 3.0).abs() < 1e-5, "greedy should hit the bound: {x_greedy}");
+    assert!(
+        (x_greedy - 3.0).abs() < 1e-5,
+        "greedy should hit the bound: {x_greedy}"
+    );
 
     let strict = SolveConfig::default(); // NullSpace
     let x_strict = solve(&levels, &strict).unwrap().x[0];
     // Lexicographic: the upper task's optimum x = 2 is preserved.
-    assert!((x_strict - 2.0).abs() < 1e-5, "strict should preserve upper: {x_strict}");
+    assert!(
+        (x_strict - 2.0).abs() < 1e-5,
+        "strict should preserve upper: {x_strict}"
+    );
 }

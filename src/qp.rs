@@ -91,6 +91,16 @@ pub enum QpSolver {
     /// updates (active-set) or re-factorisation (interior-point)
     /// needed at all.
     Admm,
+    /// ProxSuite proximal QP (feature `proxqp`).
+    Proxqp,
+    /// Eiquadprog dual active set (feature `eiquadprog`).
+    Eiquadprog,
+    /// qpOASES online active set (feature `qpoases`).
+    Qpoases,
+    /// OSQP ADMM (feature `osqp`).
+    Osqp,
+    /// HPIPM dense interior point (feature `hpipm`).
+    Hpipm,
 }
 
 // ─── Public types ───────────────────────────────────────────────────────────
@@ -106,6 +116,17 @@ pub enum QpStatus {
     Infeasible,
     /// A singular matrix or other numerical issue was encountered.
     NumericalFailure,
+}
+
+/// Native solver diagnostics. Timings exclude the independent residual checker.
+#[derive(Debug, Clone, Default)]
+pub struct QpDiagnostics {
+    pub raw_status: String,
+    pub conversion_ns: u64,
+    pub setup_ns: u64,
+    pub update_ns: u64,
+    pub solve_ns: u64,
+    pub warm_start_used: bool,
 }
 
 /// Solution returned by [`solve_qp`].
@@ -124,6 +145,8 @@ pub struct QpSolution {
     pub status: QpStatus,
     /// Number of active-set iterations performed.
     pub iterations: usize,
+    /// Backend-native status and split timing when available.
+    pub diagnostics: Option<QpDiagnostics>,
 }
 
 /// Configuration parameters for [`solve_qp`].
@@ -137,6 +160,12 @@ pub struct QpConfig {
     pub feasibility_tol: f64,
     /// Tolerance for step-norm and multiplier optimality checks.
     pub optimality_tol: f64,
+    /// For Clarabel, disable objective-relative gap termination and require
+    /// the absolute gap tolerance. Opt-in for independent residual-gated
+    /// comparisons; false preserves the original stopping policy.
+    pub absolute_gap: bool,
+    /// Keep the first inequality-bearing HQP level exact (zero slack).
+    pub hard_first_inequalities: bool,
     /// Proximal warm-start weight. When > 0 **and** an `x0` is passed
     /// to [`solve_qp`], the cost is augmented with
     /// `(prox_weight / 2) · ‖x − x0‖²`. The augmentation biases the
@@ -164,6 +193,8 @@ impl Default for QpConfig {
             max_iters: 500,
             feasibility_tol: 1e-10,
             optimality_tol: 1e-8,
+            absolute_gap: false,
+            hard_first_inequalities: false,
             prox_weight: 0.0,
         }
     }
@@ -200,6 +231,50 @@ pub struct QpWorkspace {
     ipm_s: Option<DVector<f64>>,
     ipm_z: Option<DVector<f64>>,
     ipm_y: Option<DVector<f64>>,
+    #[cfg(any(
+        feature = "proxqp",
+        feature = "eiquadprog",
+        feature = "qpoases",
+        feature = "osqp",
+        feature = "hpipm"
+    ))]
+    native: NativeWorkspace,
+}
+
+#[cfg(any(
+    feature = "proxqp",
+    feature = "eiquadprog",
+    feature = "qpoases",
+    feature = "osqp",
+    feature = "hpipm"
+))]
+#[derive(Debug, Default)]
+struct NativeWorkspace {
+    handle: usize,
+}
+#[cfg(any(
+    feature = "proxqp",
+    feature = "eiquadprog",
+    feature = "qpoases",
+    feature = "osqp",
+    feature = "hpipm"
+))]
+impl Clone for NativeWorkspace {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+#[cfg(any(
+    feature = "proxqp",
+    feature = "eiquadprog",
+    feature = "qpoases",
+    feature = "osqp",
+    feature = "hpipm"
+))]
+impl Drop for NativeWorkspace {
+    fn drop(&mut self) {
+        unsafe { misa_native_free(self.handle) };
+    }
 }
 
 impl QpWorkspace {
@@ -214,6 +289,16 @@ impl QpWorkspace {
         self.ipm_s = None;
         self.ipm_z = None;
         self.ipm_y = None;
+        #[cfg(any(
+            feature = "proxqp",
+            feature = "eiquadprog",
+            feature = "qpoases",
+            feature = "osqp",
+            feature = "hpipm"
+        ))]
+        {
+            self.native = NativeWorkspace::default();
+        }
     }
 }
 
@@ -308,16 +393,54 @@ fn solve_qp_impl(
 
     let mut workspace = workspace;
     let mut sol = match config.solver {
-        QpSolver::ActiveSet => {
-            solve_qp_active_set(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, x0, config, workspace.as_deref_mut())
-        }
-        QpSolver::Ipm => {
-            solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config, false, workspace.as_deref_mut())
-        }
-        QpSolver::IpmMcc => {
-            solve_qp_ipm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config, true, workspace.as_deref_mut())
-        }
+        QpSolver::ActiveSet => solve_qp_active_set(
+            h_eff,
+            c_eff,
+            a_eq,
+            b_eq,
+            a_iq,
+            b_iq,
+            x0,
+            config,
+            workspace.as_deref_mut(),
+        ),
+        QpSolver::Ipm => solve_qp_ipm(
+            h_eff,
+            c_eff,
+            a_eq,
+            b_eq,
+            a_iq,
+            b_iq,
+            config,
+            false,
+            workspace.as_deref_mut(),
+        ),
+        QpSolver::IpmMcc => solve_qp_ipm(
+            h_eff,
+            c_eff,
+            a_eq,
+            b_eq,
+            a_iq,
+            b_iq,
+            config,
+            true,
+            workspace.as_deref_mut(),
+        ),
         QpSolver::Admm => solve_qp_admm(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config),
+        QpSolver::Proxqp
+        | QpSolver::Eiquadprog
+        | QpSolver::Qpoases
+        | QpSolver::Osqp
+        | QpSolver::Hpipm => solve_qp_native(
+            h_eff,
+            c_eff,
+            a_eq,
+            b_eq,
+            a_iq,
+            b_iq,
+            config,
+            workspace.as_deref_mut(),
+        ),
         QpSolver::Clarabel => {
             #[cfg(feature = "clarabel")]
             {
@@ -416,7 +539,10 @@ fn solve_qp_active_set(
             lo <= 1e-4 * hi
         });
         if ill {
-            let scale = (0..n).map(|i| h[(i, i)].abs()).fold(0.0, f64::max).max(1e-12);
+            let scale = (0..n)
+                .map(|i| h[(i, i)].abs())
+                .fold(0.0, f64::max)
+                .max(1e-12);
             // Cap the iteration Hessian at κ ≈ 1e6 — comfortably
             // inside the crawl-free regime; the polish undoes the bias.
             ridge = 1e-6 * scale;
@@ -551,7 +677,16 @@ fn solve_qp_active_set(
             if p.norm() < config.optimality_tol {
                 if ridge > 0.0 {
                     polish(
-                        &mut x, &mut lam_eq, &mut lam_iq, h, c, &ae, &be, &ai, &bi, &ws_idx,
+                        &mut x,
+                        &mut lam_eq,
+                        &mut lam_iq,
+                        h,
+                        c,
+                        &ae,
+                        &be,
+                        &ai,
+                        &bi,
+                        &ws_idx,
                         config,
                     );
                 }
@@ -613,8 +748,17 @@ fn solve_qp_active_set(
                         }
                         if ridge > 0.0 {
                             polish(
-                                &mut x, &mut lam_eq, &mut lam_iq, h, c, &ae, &be, &ai, &bi,
-                                &ws_idx, config,
+                                &mut x,
+                                &mut lam_eq,
+                                &mut lam_iq,
+                                h,
+                                c,
+                                &ae,
+                                &be,
+                                &ai,
+                                &bi,
+                                &ws_idx,
+                                config,
                             );
                         }
                         stash(workspace.as_deref_mut(), &x, &ws_idx);
@@ -644,15 +788,7 @@ fn solve_qp_active_set(
                         ws_idx.pop();
                     } else {
                         stash(workspace.as_deref_mut(), &x, &ws_idx);
-                        return make_sol(
-                            x,
-                            h,
-                            c,
-                            lam_eq,
-                            lam_iq,
-                            QpStatus::NumericalFailure,
-                            iter,
-                        );
+                        return make_sol(x, h, c, lam_eq, lam_iq, QpStatus::NumericalFailure, iter);
                     }
                 }
             }
@@ -660,7 +796,15 @@ fn solve_qp_active_set(
     }
 
     stash(workspace.as_deref_mut(), &x, &ws_idx);
-    make_sol(x, h, c, lam_eq, lam_iq, QpStatus::MaxIterations, config.max_iters)
+    make_sol(
+        x,
+        h,
+        c,
+        lam_eq,
+        lam_iq,
+        QpStatus::MaxIterations,
+        config.max_iters,
+    )
 }
 
 /// Cold-start point: the caller's `x0`, else Phase-1.
@@ -758,7 +902,9 @@ fn polish(
         rhs[n + i] = bhat[i];
     }
 
-    let Some(sol) = kkt.lu().solve(&rhs) else { return };
+    let Some(sol) = kkt.lu().solve(&rhs) else {
+        return;
+    };
     let xp = sol.rows(0, n).into_owned();
 
     // Primal feasibility of the inactive inequalities…
@@ -1101,6 +1247,7 @@ fn fail(n: usize, m_eq: usize, m_iq: usize, status: QpStatus) -> QpSolution {
         lambda_iq: DVector::zeros(m_iq),
         status,
         iterations: 0,
+        diagnostics: None,
     }
 }
 
@@ -1132,6 +1279,7 @@ fn make_sol(
         lambda_iq: lam_iq,
         status,
         iterations: iters,
+        diagnostics: None,
     }
 }
 
@@ -1290,7 +1438,11 @@ fn solve_qp_admm(
         let r_prim = &a * &x_new - &z_new;
         let r_dual = h * &x_new + c + &a_t * &y_new;
         let scale_p = 1.0 + (&a * &x_new).amax().max(z_new.amax());
-        let scale_d = 1.0 + (h * &x_new).amax().max((&a_t * &y_new).amax()).max(c.amax());
+        let scale_d = 1.0
+            + (h * &x_new)
+                .amax()
+                .max((&a_t * &y_new).amax())
+                .max(c.amax());
         x = x_new;
         z = z_new;
         y = y_new;
@@ -1438,9 +1590,21 @@ fn solve_qp_ipm(
 
         // ── Residuals at the current point ────────────────────────
         let r_stat = h * &x + c + ae.transpose() * &y + ai.transpose() * &z;
-        let r_eq = if m_eq > 0 { &ae * &x - &be } else { DVector::zeros(0) };
-        let r_iq = if m_iq > 0 { &ai * &x + &s - &bi } else { DVector::zeros(0) };
-        let mu = if m_iq > 0 { s.dot(&z) / m_iq as f64 } else { 0.0 };
+        let r_eq = if m_eq > 0 {
+            &ae * &x - &be
+        } else {
+            DVector::zeros(0)
+        };
+        let r_iq = if m_iq > 0 {
+            &ai * &x + &s - &bi
+        } else {
+            DVector::zeros(0)
+        };
+        let mu = if m_iq > 0 {
+            s.dot(&z) / m_iq as f64
+        } else {
+            0.0
+        };
 
         // ── Convergence check ─────────────────────────────────────
         let scale = 1.0 + c.norm();
@@ -1507,7 +1671,11 @@ fn solve_qp_ipm(
         let mu_aff = s_aff.dot(&z_aff) / m_iq as f64;
 
         // Mehrotra's centering parameter.
-        let sigma = if mu > 1e-14 { (mu_aff / mu).powi(3).clamp(0.0, 1.0) } else { 0.0 };
+        let sigma = if mu > 1e-14 {
+            (mu_aff / mu).powi(3).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let sigma_mu = sigma * mu;
 
         // ── Corrector: centered target + the affine step's 2nd-order term ──
@@ -1690,10 +1858,11 @@ fn solve_qp_clarabel(
     config: &QpConfig,
 ) -> QpSolution {
     use clarabel::solver::{
-        DefaultSettings, DefaultSettingsBuilder, DefaultSolver, IPSolver,
-        SolverStatus, SupportedConeT,
+        DefaultSettings, DefaultSettingsBuilder, DefaultSolver, IPSolver, SolverStatus,
+        SupportedConeT,
     };
 
+    let conversion_start = std::time::Instant::now();
     let n = h.nrows();
     let (ae, be) = unpack_pair(a_eq, b_eq, n, "a_eq / b_eq");
     let (ai, bi) = unpack_pair(a_iq, b_iq, n, "a_iq / b_iq");
@@ -1745,16 +1914,25 @@ fn solve_qp_clarabel(
     let settings = DefaultSettingsBuilder::default()
         .max_iter(config.max_iters as u32)
         .tol_gap_abs(config.optimality_tol)
-        .tol_gap_rel(config.optimality_tol)
+        .tol_gap_rel(if config.absolute_gap {
+            0.0
+        } else {
+            config.optimality_tol
+        })
         .tol_feas(config.feasibility_tol)
         .verbose(false)
         .build()
         .unwrap_or_else(|_| DefaultSettings::default());
 
     // ── Solve ───────────────────────────────────────────────────────
+    let conversion_ns = conversion_start.elapsed().as_nanos() as u64;
+    let setup_start = std::time::Instant::now();
     let mut solver = DefaultSolver::new(&p, &q, &a_csc, &b_vec, &cones, settings)
         .expect("Clarabel: failed to construct solver (bad problem dimensions?)");
+    let setup_ns = setup_start.elapsed().as_nanos() as u64;
+    let solve_start = std::time::Instant::now();
     solver.solve();
+    let solve_ns = solve_start.elapsed().as_nanos() as u64;
 
     let status = match solver.solution.status {
         SolverStatus::Solved | SolverStatus::AlmostSolved => QpStatus::Optimal,
@@ -1789,6 +1967,13 @@ fn solve_qp_clarabel(
         lambda_iq: lam_iq,
         status,
         iterations: solver.solution.iterations as usize,
+        diagnostics: Some(QpDiagnostics {
+            raw_status: format!("{:?}", solver.solution.status),
+            conversion_ns,
+            setup_ns,
+            solve_ns,
+            ..Default::default()
+        }),
     }
 }
 
@@ -1840,6 +2025,87 @@ fn dense_to_csc_full(m: &DMatrix<f64>) -> clarabel::algebra::CscMatrix<f64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// BUG (found 2026-09-25): the active-set solver returns `Infeasible` on a
+    /// feasible equality-constrained problem when the warm start `x0` does not
+    /// satisfy the equalities. Clarabel solves it either way.
+    ///
+    /// This is not academic: `wrench_mpc` builds its `initial` from the
+    /// vertical-force schedule alone, so any equality added to that problem is
+    /// violated by the warm start and the whole solve is reported infeasible.
+    /// Until it is fixed, callers passing equalities must pass `x0 = None` (or
+    /// a point that satisfies them).
+    ///
+    /// min |x|^2 s.t. x0 + x1 = 1, with a slack inequality. Answer: (0.5, 0.5).
+    #[test]
+    fn equality_qp_is_solved_even_from_a_violating_warm_start() {
+        let h = DMatrix::identity(2, 2) * 2.0;
+        let c = DVector::zeros(2);
+        let a_eq = DMatrix::from_row_slice(1, 2, &[1.0, 1.0]);
+        let b_eq = DVector::from_vec(vec![1.0]);
+        // x0 <= 10 : never active
+        let a_iq = DMatrix::from_row_slice(1, 2, &[1.0, 0.0]);
+        let b_iq = DVector::from_vec(vec![10.0]);
+        for solver in [QpSolver::ActiveSet, QpSolver::Clarabel] {
+            let cfg = QpConfig { solver, ..Default::default() };
+            let sol = solve_qp(&h, &c, Some(&a_eq), Some(&b_eq), Some(&a_iq), Some(&b_iq), None, &cfg);
+            // Now with a warm start that VIOLATES the equality, which is what
+            // the MPC does (its `initial` is built from the fz schedule only).
+            let x0 = DVector::from_vec(vec![5.0, 5.0]);
+            let s2 = solve_qp(&h, &c, Some(&a_eq), Some(&b_eq), Some(&a_iq), Some(&b_iq), Some(&x0), &cfg);
+            if solver == QpSolver::ActiveSet {
+                // Known bug, documented above; assert the CURRENT behaviour so
+                // the day it is fixed this test fails and says so.
+                assert_eq!(
+                    s2.status,
+                    QpStatus::Infeasible,
+                    "active set now handles a violating warm start -- remove the \
+                     workaround in wrench_mpc::solve_dense"
+                );
+            } else {
+                assert_eq!(s2.status, QpStatus::Optimal, "{solver:?}");
+                assert!((s2.x[0] - 0.5).abs() < 1e-6);
+            }
+            assert_eq!(sol.status, QpStatus::Optimal, "{solver:?}");
+            assert!((sol.x[0] - 0.5).abs() < 1e-6 && (sol.x[1] - 0.5).abs() < 1e-6, "{solver:?}");
+        }
+    }
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn clarabel_absolute_gap_calibrates_large_objective_without_changing_default() {
+        assert!(!QpConfig::default().absolute_gap);
+        // A large unconstrained objective contribution must not relax the
+        // complementary-slackness accuracy of an unrelated active bound.
+        let h = DMatrix::identity(2, 2);
+        let g = DVector::from_vec(vec![-2., -1000.]);
+        let a = DMatrix::from_row_slice(1, 2, &[1., 0.]);
+        let b = DVector::from_element(1, 1.);
+        let baseline = QpConfig {
+            solver: QpSolver::Clarabel,
+            feasibility_tol: 1e-8,
+            optimality_tol: 1e-6,
+            ..Default::default()
+        };
+        let relaxed = solve_qp(&h, &g, None, None, Some(&a), Some(&b), None, &baseline);
+        let absolute = solve_qp(
+            &h,
+            &g,
+            None,
+            None,
+            Some(&a),
+            Some(&b),
+            None,
+            &QpConfig {
+                absolute_gap: true,
+                ..baseline
+            },
+        );
+        let r_relaxed = crate::qp_check::check(&h, &g, None, Some((&a, &b)), &relaxed);
+        let r_absolute = crate::qp_check::check(&h, &g, None, Some((&a, &b)), &absolute);
+        assert!(absolute.formally_solved(), "{absolute:?}");
+        assert!(r_absolute.accepted(1e-6), "{absolute:?} {r_absolute:?}");
+        assert!(r_absolute.complementarity_raw <= r_relaxed.complementarity_raw + 1e-12);
+    }
     use super::*;
     use approx::assert_relative_eq;
 
@@ -1868,8 +2134,14 @@ mod tests {
         let b_iq = DVector::from_vec(vec![1.0, 1.0]);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            None,
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 1.0, epsilon = 1e-8);
@@ -1886,8 +2158,14 @@ mod tests {
         let b_iq = DVector::from_vec(vec![5.0, 5.0]);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            None,
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 0.0, epsilon = 1e-8);
@@ -1904,8 +2182,14 @@ mod tests {
         let b_iq = DVector::from_vec(vec![1.0, 2.0]);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            None,
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 1.0, epsilon = 1e-8);
@@ -1919,17 +2203,18 @@ mod tests {
         let h = DMatrix::identity(2, 2);
         let c = DVector::from_vec(vec![-5.0, 3.0]);
         // x1 ≤ 2, x2 ≤ 2, -x1 ≤ 1, -x2 ≤ 1
-        let a_iq = DMatrix::from_row_slice(4, 2, &[
-            1.0,  0.0,
-            0.0,  1.0,
-            -1.0, 0.0,
-            0.0, -1.0,
-        ]);
+        let a_iq = DMatrix::from_row_slice(4, 2, &[1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0]);
         let b_iq = DVector::from_vec(vec![2.0, 2.0, 1.0, 1.0]);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            None,
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 2.0, epsilon = 1e-8);
@@ -1946,9 +2231,14 @@ mod tests {
         let b_eq = DVector::from_element(1, 1.0);
 
         let sol = solve_qp(
-            &h, &c,
-            Some(&a_eq), Some(&b_eq),
-            None, None, None, &QpConfig::default(),
+            &h,
+            &c,
+            Some(&a_eq),
+            Some(&b_eq),
+            None,
+            None,
+            None,
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 0.5, epsilon = 1e-8);
@@ -1969,9 +2259,12 @@ mod tests {
         let b_iq = DVector::zeros(2);
 
         let sol = solve_qp(
-            &h, &c,
-            Some(&a_eq), Some(&b_eq),
-            Some(&a_iq), Some(&b_iq),
+            &h,
+            &c,
+            Some(&a_eq),
+            Some(&b_eq),
+            Some(&a_iq),
+            Some(&b_iq),
             None,
             &QpConfig::default(),
         );
@@ -1993,9 +2286,12 @@ mod tests {
         let b_iq = DVector::from_element(1, 0.5);
 
         let sol = solve_qp(
-            &h, &c,
-            Some(&a_eq), Some(&b_eq),
-            Some(&a_iq), Some(&b_iq),
+            &h,
+            &c,
+            Some(&a_eq),
+            Some(&b_eq),
+            Some(&a_iq),
+            Some(&b_iq),
             None,
             &QpConfig::default(),
         );
@@ -2009,15 +2305,19 @@ mod tests {
         // Same as box_constraints but with user-provided x0 = (0,0).
         let h = DMatrix::identity(2, 2);
         let c = DVector::from_vec(vec![-5.0, 3.0]);
-        let a_iq = DMatrix::from_row_slice(4, 2, &[
-            1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0,
-        ]);
+        let a_iq = DMatrix::from_row_slice(4, 2, &[1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0]);
         let b_iq = DVector::from_vec(vec![2.0, 2.0, 1.0, 1.0]);
         let x0 = DVector::from_vec(vec![0.0, 0.0]);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), Some(&x0), &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            Some(&x0),
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 2.0, epsilon = 1e-8);
@@ -2061,8 +2361,14 @@ mod tests {
 
         let x0 = DVector::from_element(n, 1.0); // feasible start: sum=5
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), Some(&x0), &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            Some(&x0),
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         for i in 0..n {
@@ -2078,8 +2384,14 @@ mod tests {
         let b_iq = DVector::from_vec(vec![1.0, 1.0]);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            None,
+            &QpConfig::default(),
         );
         // x = (1,1), obj = 0.5*(1+1) + (-2-2) = 1 - 4 = -3
         assert_relative_eq!(sol.objective, -3.0, epsilon = 1e-8);
@@ -2095,12 +2407,21 @@ mod tests {
         let b_iq = DVector::from_element(1, 1.0);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            None,
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 1.0, epsilon = 1e-10);
-        assert!(sol.lambda_iq[0] > 0.0, "active inequality multiplier should be positive");
+        assert!(
+            sol.lambda_iq[0] > 0.0,
+            "active inequality multiplier should be positive"
+        );
         assert_relative_eq!(sol.lambda_iq[0], 1.0, epsilon = 1e-8);
     }
 
@@ -2114,8 +2435,14 @@ mod tests {
         let b_iq = DVector::from_vec(vec![1.0, 1.0]);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            None,
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x.norm(), 0.0, epsilon = 1e-8);
@@ -2132,8 +2459,14 @@ mod tests {
         let b_iq = DVector::from_element(1, 1.0);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            None,
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 0.5, epsilon = 1e-8);
@@ -2148,14 +2481,18 @@ mod tests {
         let h = DMatrix::from_row_slice(2, 2, &[3.0, 1.0, 1.0, 1.0]);
         let c = DVector::from_vec(vec![-1.0, 0.0]);
         // box: x1 ≤ 1, x2 ≤ 1, -x1 ≤ 1, -x2 ≤ 1
-        let a_iq = DMatrix::from_row_slice(4, 2, &[
-            1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0,
-        ]);
+        let a_iq = DMatrix::from_row_slice(4, 2, &[1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0]);
         let b_iq = DVector::from_vec(vec![1.0, 1.0, 1.0, 1.0]);
 
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &QpConfig::default(),
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            None,
+            &QpConfig::default(),
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 0.5, epsilon = 1e-6);
@@ -2176,8 +2513,14 @@ mod tests {
         x0: Option<&DVector<f64>>,
         tol: f64,
     ) {
-        let cfg_as = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
-        let cfg_cl = QpConfig { solver: QpSolver::Clarabel, ..Default::default() };
+        let cfg_as = QpConfig {
+            solver: QpSolver::ActiveSet,
+            ..Default::default()
+        };
+        let cfg_cl = QpConfig {
+            solver: QpSolver::Clarabel,
+            ..Default::default()
+        };
         let sol_as = solve_qp(h, c, a_eq, b_eq, a_iq, b_iq, x0, &cfg_as);
         let sol_cl = solve_qp(h, c, a_eq, b_eq, a_iq, b_iq, None, &cfg_cl);
         assert_eq!(sol_as.status, QpStatus::Optimal, "ActiveSet not Optimal");
@@ -2226,9 +2569,12 @@ mod tests {
         let a_iq = DMatrix::from_row_slice(1, 2, &[1.0, 0.0]);
         let b_iq = DVector::from_element(1, 0.5);
         cross_validate(
-            &h, &c,
-            Some(&a_eq), Some(&b_eq),
-            Some(&a_iq), Some(&b_iq),
+            &h,
+            &c,
+            Some(&a_eq),
+            Some(&b_eq),
+            Some(&a_iq),
+            Some(&b_iq),
             None,
             1e-6,
         );
@@ -2239,9 +2585,7 @@ mod tests {
     fn clarabel_box_constraints() {
         let h = DMatrix::identity(2, 2);
         let c = DVector::from_vec(vec![-5.0, 3.0]);
-        let a_iq = DMatrix::from_row_slice(4, 2, &[
-            1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0,
-        ]);
+        let a_iq = DMatrix::from_row_slice(4, 2, &[1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0]);
         let b_iq = DVector::from_vec(vec![2.0, 2.0, 1.0, 1.0]);
         cross_validate(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, 1e-6);
     }
@@ -2254,12 +2598,16 @@ mod tests {
         let c = DVector::zeros(n);
         let mut rows = Vec::new();
         let mut sum_row = vec![0.0; n];
-        for v in &mut sum_row { *v = -1.0; }
+        for v in &mut sum_row {
+            *v = -1.0;
+        }
         rows.push((sum_row, -5.0));
         for i in 0..n {
-            let mut r_u = vec![0.0; n]; r_u[i] = 1.0;
+            let mut r_u = vec![0.0; n];
+            r_u[i] = 1.0;
             rows.push((r_u, 3.0));
-            let mut r_l = vec![0.0; n]; r_l[i] = -1.0;
+            let mut r_l = vec![0.0; n];
+            r_l[i] = -1.0;
             rows.push((r_l, 0.0));
         }
         let m = rows.len();
@@ -2272,7 +2620,16 @@ mod tests {
         let a_iq = DMatrix::from_row_slice(m, n, &a_data);
         let b_iq = DVector::from_vec(b_data);
         let x0 = DVector::from_element(n, 1.0); // feasible start: sum=5
-        cross_validate(&h, &c, None, None, Some(&a_iq), Some(&b_iq), Some(&x0), 1e-5);
+        cross_validate(
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            Some(&x0),
+            1e-5,
+        );
     }
 
     /// Proximal warm-start: a tiny prox term should not move the
@@ -2294,8 +2651,14 @@ mod tests {
             ..QpConfig::default()
         };
         let sol = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), Some(&x0), &cfg,
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            Some(&x0),
+            &cfg,
         );
         assert_eq!(sol.status, QpStatus::Optimal);
         // Objective must report on the **original** cost (½‖x‖² − 2(x₁+x₂)).
@@ -2322,9 +2685,7 @@ mod tests {
             prox_weight: 1e-3,
             ..QpConfig::default()
         };
-        let sol = solve_qp(
-            &h, &c, None, None, None, None, Some(&x0), &cfg,
-        );
+        let sol = solve_qp(&h, &c, None, None, None, None, Some(&x0), &cfg);
         assert_eq!(sol.status, QpStatus::Optimal);
         // Both coordinates should be close to 0.5 (the prox-anchored
         // closest point on the optimum line). Tolerance accounts for
@@ -2346,13 +2707,16 @@ mod tests {
 
         let cfg = QpConfig::default();
         assert_eq!(cfg.prox_weight, 0.0);
-        let sol_no_x0 = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), None, &cfg,
-        );
+        let sol_no_x0 = solve_qp(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, &cfg);
         let sol_with_x0 = solve_qp(
-            &h, &c, None, None,
-            Some(&a_iq), Some(&b_iq), Some(&x0), &cfg,
+            &h,
+            &c,
+            None,
+            None,
+            Some(&a_iq),
+            Some(&b_iq),
+            Some(&x0),
+            &cfg,
         );
         // Both reach the same optimum (1, 1).
         assert_relative_eq!(sol_no_x0.x[0], sol_with_x0.x[0], epsilon = 1e-6);
@@ -2365,9 +2729,7 @@ mod tests {
     fn clarabel_non_identity_hessian() {
         let h = DMatrix::from_row_slice(2, 2, &[3.0, 1.0, 1.0, 1.0]);
         let c = DVector::from_vec(vec![-1.0, 0.0]);
-        let a_iq = DMatrix::from_row_slice(4, 2, &[
-            1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0,
-        ]);
+        let a_iq = DMatrix::from_row_slice(4, 2, &[1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0]);
         let b_iq = DVector::from_vec(vec![1.0, 1.0, 1.0, 1.0]);
         cross_validate(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, 1e-6);
     }
@@ -2377,7 +2739,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next_f64(&mut self) -> f64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
         }
     }
@@ -2388,7 +2753,14 @@ mod tests {
         n: usize,
         m_eq: usize,
         m_iq: usize,
-    ) -> (DMatrix<f64>, DVector<f64>, DMatrix<f64>, DVector<f64>, DMatrix<f64>, DVector<f64>) {
+    ) -> (
+        DMatrix<f64>,
+        DVector<f64>,
+        DMatrix<f64>,
+        DVector<f64>,
+        DMatrix<f64>,
+        DVector<f64>,
+    ) {
         let a = DMatrix::from_fn(n, n, |_, _| rng.next_f64());
         let h = &a * a.transpose() + DMatrix::identity(n, n);
         let c = DVector::from_fn(n, |_, _| rng.next_f64());
@@ -2435,10 +2807,22 @@ mod tests {
     fn active_set_satisfies_kkt_on_random_problems() {
         // Hammers the incremental add / remove factor paths.
         let mut rng = Lcg(0xFEED);
-        let cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::ActiveSet,
+            ..Default::default()
+        };
         for _ in 0..25 {
             let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 10, 3, 12);
-            let sol = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            let sol = solve_qp(
+                &h,
+                &c,
+                Some(&ae),
+                Some(&be),
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+            );
             assert_kkt(&h, &c, &ae, &be, &ai, &bi, &sol);
         }
     }
@@ -2447,16 +2831,37 @@ mod tests {
     fn warm_resolve_of_identical_qp_is_one_iteration() {
         let mut rng = Lcg(0xBEEF);
         let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 12, 3, 14);
-        let cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::ActiveSet,
+            ..Default::default()
+        };
         let mut ws = QpWorkspace::new();
 
-        let cold =
-            solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+        let cold = solve_qp_warm(
+            &h,
+            &c,
+            Some(&ae),
+            Some(&be),
+            Some(&ai),
+            Some(&bi),
+            None,
+            &cfg,
+            &mut ws,
+        );
         assert_eq!(cold.status, QpStatus::Optimal);
         assert!(cold.iterations > 0, "cold solve should iterate");
 
-        let warm =
-            solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+        let warm = solve_qp_warm(
+            &h,
+            &c,
+            Some(&ae),
+            Some(&be),
+            Some(&ai),
+            Some(&bi),
+            None,
+            &cfg,
+            &mut ws,
+        );
         assert_eq!(warm.status, QpStatus::Optimal);
         assert!(
             warm.iterations <= 1,
@@ -2473,7 +2878,10 @@ mod tests {
         // restarts must stay correct (KKT) and cheaper than cold.
         let mut rng = Lcg(0xCAFE);
         let (h, c0, ae, be0, ai, bi) = random_qp(&mut rng, 12, 3, 14);
-        let cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::ActiveSet,
+            ..Default::default()
+        };
         let mut ws = QpWorkspace::new();
         let mut warm_iters = 0usize;
         let mut cold_iters = 0usize;
@@ -2481,15 +2889,38 @@ mod tests {
         for t in 0..20 {
             let phase = t as f64 * 0.15;
             let c = &c0 + DVector::from_fn(c0.len(), |i, _| 0.01 * (phase + i as f64).sin());
-            let be = &be0 + DVector::from_fn(be0.len(), |i, _| 0.005 * (phase * 1.3 + i as f64).cos());
+            let be =
+                &be0 + DVector::from_fn(be0.len(), |i, _| 0.005 * (phase * 1.3 + i as f64).cos());
 
-            let warm = solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+            let warm = solve_qp_warm(
+                &h,
+                &c,
+                Some(&ae),
+                Some(&be),
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+                &mut ws,
+            );
             assert_kkt(&h, &c, &ae, &be, &ai, &bi, &warm);
             warm_iters += warm.iterations;
 
-            let cold = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            let cold = solve_qp(
+                &h,
+                &c,
+                Some(&ae),
+                Some(&be),
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+            );
             cold_iters += cold.iterations;
-            assert!((&warm.x - &cold.x).norm() < 1e-6, "tick {t}: warm and cold disagree");
+            assert!(
+                (&warm.x - &cold.x).norm() < 1e-6,
+                "tick {t}: warm and cold disagree"
+            );
         }
         assert!(
             warm_iters < cold_iters,
@@ -2513,18 +2944,32 @@ mod tests {
             let c = -(a.transpose() * &b);
             let d = DMatrix::from_fn(44, n, |i, j| ((i * 5 + j * 3) as f64 * 0.23).cos());
             let f = DVector::from_fn(44, |i, _| 0.5 + 0.1 * ((i as f64) * 0.7).sin().abs());
-            let cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+            let cfg = QpConfig {
+                solver: QpSolver::ActiveSet,
+                ..Default::default()
+            };
 
             let sol = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
             assert_eq!(sol.status, QpStatus::Optimal, "rows={rows}: crawled");
-            assert!(sol.iterations < 50, "rows={rows}: {} iterations", sol.iterations);
+            assert!(
+                sol.iterations < 50,
+                "rows={rows}: {} iterations",
+                sol.iterations
+            );
             // KKT of the ORIGINAL (unridged) problem.
             let stat = &h * &sol.x + &c + d.transpose() * &sol.lambda_iq;
-            assert!(stat.norm() < 1e-5, "rows={rows}: stationarity {}", stat.norm());
+            assert!(
+                stat.norm() < 1e-5,
+                "rows={rows}: stationarity {}",
+                stat.norm()
+            );
             for i in 0..44 {
                 let slack = f[i] - (d.row(i) * &sol.x)[0];
                 assert!(slack > -1e-6, "rows={rows}: iq {i} violated");
-                assert!(sol.lambda_iq[i] > -1e-6, "rows={rows}: dual infeasible at {i}");
+                assert!(
+                    sol.lambda_iq[i] > -1e-6,
+                    "rows={rows}: dual infeasible at {i}"
+                );
             }
         }
     }
@@ -2534,10 +2979,22 @@ mod tests {
     #[test]
     fn ipm_satisfies_kkt_on_random_problems() {
         let mut rng = Lcg(0xC0FFEE);
-        let cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Ipm,
+            ..Default::default()
+        };
         for _ in 0..25 {
             let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 10, 3, 12);
-            let sol = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            let sol = solve_qp(
+                &h,
+                &c,
+                Some(&ae),
+                Some(&be),
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+            );
             assert_kkt(&h, &c, &ae, &be, &ai, &bi, &sol);
         }
     }
@@ -2548,8 +3005,14 @@ mod tests {
         // methods (barrier path-following vs active-set) must land on
         // the same x, not just the same objective.
         let mut rng = Lcg(0xFACADE);
-        let ipm_cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
-        let as_cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let ipm_cfg = QpConfig {
+            solver: QpSolver::Ipm,
+            ..Default::default()
+        };
+        let as_cfg = QpConfig {
+            solver: QpSolver::ActiveSet,
+            ..Default::default()
+        };
         for _ in 0..15 {
             let n = 10;
             let a = DMatrix::from_fn(n, n, |_, _| rng.next_f64());
@@ -2579,7 +3042,10 @@ mod tests {
         let b = DVector::from_vec(vec![1.0]);
         let h = DMatrix::identity(2, 2);
         let c = DVector::zeros(2);
-        let cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Ipm,
+            ..Default::default()
+        };
         let sol = solve_qp(&h, &c, Some(&a), Some(&b), None, None, None, &cfg);
         assert_eq!(sol.status, QpStatus::Optimal);
         // One Newton step to solve, one more loop entry to confirm
@@ -2596,7 +3062,11 @@ mod tests {
         let c = DVector::from_vec(vec![-1.0, -1.0]);
         let d = DMatrix::from_row_slice(1, 2, &[1.0, 1.0]);
         let f = DVector::from_vec(vec![1.0]);
-        let cfg = QpConfig { solver: QpSolver::Ipm, max_iters: 0, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Ipm,
+            max_iters: 0,
+            ..Default::default()
+        };
         let sol = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
         assert_eq!(sol.status, QpStatus::MaxIterations);
     }
@@ -2606,10 +3076,22 @@ mod tests {
     #[test]
     fn ipm_mcc_satisfies_kkt_on_random_problems() {
         let mut rng = Lcg(0xC0FFEE);
-        let cfg = QpConfig { solver: QpSolver::IpmMcc, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::IpmMcc,
+            ..Default::default()
+        };
         for _ in 0..25 {
             let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 10, 3, 12);
-            let sol = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            let sol = solve_qp(
+                &h,
+                &c,
+                Some(&ae),
+                Some(&be),
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+            );
             assert_kkt(&h, &c, &ae, &be, &ai, &bi, &sol);
         }
     }
@@ -2619,8 +3101,14 @@ mod tests {
         // Adding centrality correctors changes the path taken, not the
         // problem: both must land on the same unique optimum.
         let mut rng = Lcg(0xFACADE);
-        let mcc_cfg = QpConfig { solver: QpSolver::IpmMcc, ..Default::default() };
-        let plain_cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        let mcc_cfg = QpConfig {
+            solver: QpSolver::IpmMcc,
+            ..Default::default()
+        };
+        let plain_cfg = QpConfig {
+            solver: QpSolver::Ipm,
+            ..Default::default()
+        };
         for _ in 0..15 {
             let n = 10;
             let a = DMatrix::from_fn(n, n, |_, _| rng.next_f64());
@@ -2650,7 +3138,10 @@ mod tests {
         let b = DVector::from_vec(vec![1.0]);
         let h = DMatrix::identity(2, 2);
         let c = DVector::zeros(2);
-        let cfg = QpConfig { solver: QpSolver::IpmMcc, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::IpmMcc,
+            ..Default::default()
+        };
         let sol = solve_qp(&h, &c, Some(&a), Some(&b), None, None, None, &cfg);
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_eq!(sol.iterations, 2);
@@ -2667,7 +3158,10 @@ mod tests {
         // solution's mu instead of from mu=1 every time.
         let mut rng = Lcg(0xCAFE);
         let (h, c0, ae, be0, ai, bi) = random_qp(&mut rng, 12, 3, 14);
-        let cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Ipm,
+            ..Default::default()
+        };
         let mut ws = QpWorkspace::new();
         let mut warm_iters = 0usize;
         let mut cold_iters = 0usize;
@@ -2675,16 +3169,38 @@ mod tests {
         for t in 0..20 {
             let phase = t as f64 * 0.15;
             let c = &c0 + DVector::from_fn(c0.len(), |i, _| 0.01 * (phase + i as f64).sin());
-            let be = &be0 + DVector::from_fn(be0.len(), |i, _| 0.005 * (phase * 1.3 + i as f64).cos());
+            let be =
+                &be0 + DVector::from_fn(be0.len(), |i, _| 0.005 * (phase * 1.3 + i as f64).cos());
 
-            let warm =
-                solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+            let warm = solve_qp_warm(
+                &h,
+                &c,
+                Some(&ae),
+                Some(&be),
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+                &mut ws,
+            );
             assert_kkt(&h, &c, &ae, &be, &ai, &bi, &warm);
             warm_iters += warm.iterations;
 
-            let cold = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            let cold = solve_qp(
+                &h,
+                &c,
+                Some(&ae),
+                Some(&be),
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+            );
             cold_iters += cold.iterations;
-            assert!((&warm.x - &cold.x).norm() < 1e-4, "tick {t}: warm and cold disagree");
+            assert!(
+                (&warm.x - &cold.x).norm() < 1e-4,
+                "tick {t}: warm and cold disagree"
+            );
         }
         assert!(
             warm_iters < cold_iters,
@@ -2700,14 +3216,36 @@ mod tests {
         // or silently misuse mismatched vectors.
         let mut rng = Lcg(0xFEED);
         let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 8, 2, 6);
-        let cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Ipm,
+            ..Default::default()
+        };
         let mut ws = QpWorkspace::new();
-        let _ = solve_qp_warm(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg, &mut ws);
+        let _ = solve_qp_warm(
+            &h,
+            &c,
+            Some(&ae),
+            Some(&be),
+            Some(&ai),
+            Some(&bi),
+            None,
+            &cfg,
+            &mut ws,
+        );
 
         // Different shape: n=12, m_eq=4, m_iq=10.
         let (h2, c2, ae2, be2, ai2, bi2) = random_qp(&mut rng, 12, 4, 10);
-        let sol =
-            solve_qp_warm(&h2, &c2, Some(&ae2), Some(&be2), Some(&ai2), Some(&bi2), None, &cfg, &mut ws);
+        let sol = solve_qp_warm(
+            &h2,
+            &c2,
+            Some(&ae2),
+            Some(&be2),
+            Some(&ai2),
+            Some(&bi2),
+            None,
+            &cfg,
+            &mut ws,
+        );
         assert_kkt(&h2, &c2, &ae2, &be2, &ai2, &bi2, &sol);
     }
 
@@ -2716,10 +3254,23 @@ mod tests {
     #[test]
     fn admm_satisfies_kkt_on_random_problems() {
         let mut rng = Lcg(0xADD3D);
-        let cfg = QpConfig { solver: QpSolver::Admm, max_iters: 5000, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Admm,
+            max_iters: 5000,
+            ..Default::default()
+        };
         for _ in 0..25 {
             let (h, c, ae, be, ai, bi) = random_qp(&mut rng, 10, 3, 12);
-            let sol = solve_qp(&h, &c, Some(&ae), Some(&be), Some(&ai), Some(&bi), None, &cfg);
+            let sol = solve_qp(
+                &h,
+                &c,
+                Some(&ae),
+                Some(&be),
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+            );
             assert_kkt(&h, &c, &ae, &be, &ai, &bi, &sol);
         }
     }
@@ -2733,8 +3284,15 @@ mod tests {
         // bug, so the budget here is set accordingly rather than tuned
         // down to "prove" a fast answer.
         let mut rng = Lcg(0xFACADE);
-        let admm_cfg = QpConfig { solver: QpSolver::Admm, max_iters: 5000, ..Default::default() };
-        let as_cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let admm_cfg = QpConfig {
+            solver: QpSolver::Admm,
+            max_iters: 5000,
+            ..Default::default()
+        };
+        let as_cfg = QpConfig {
+            solver: QpSolver::ActiveSet,
+            ..Default::default()
+        };
         for _ in 0..15 {
             let n = 10;
             let a = DMatrix::from_fn(n, n, |_, _| rng.next_f64());
@@ -2764,7 +3322,11 @@ mod tests {
         let b = DVector::from_vec(vec![1.0]);
         let h = DMatrix::identity(2, 2);
         let c = DVector::zeros(2);
-        let cfg = QpConfig { solver: QpSolver::Admm, max_iters: 2000, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Admm,
+            max_iters: 2000,
+            ..Default::default()
+        };
         let sol = solve_qp(&h, &c, Some(&a), Some(&b), None, None, None, &cfg);
         assert_eq!(sol.status, QpStatus::Optimal);
         assert!((sol.x[0] - 0.5).abs() < 1e-6 && (sol.x[1] - 0.5).abs() < 1e-6);
@@ -2775,7 +3337,10 @@ mod tests {
         // No constraints at all (m = 0): the fast path x = -H⁻¹c.
         let h = DMatrix::from_row_slice(2, 2, &[2.0, 0.0, 0.0, 2.0]);
         let c = DVector::from_vec(vec![-4.0, -6.0]);
-        let cfg = QpConfig { solver: QpSolver::Admm, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Admm,
+            ..Default::default()
+        };
         let sol = solve_qp(&h, &c, None, None, None, None, None, &cfg);
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_eq!(sol.iterations, 0);
@@ -2796,11 +3361,21 @@ mod tests {
         let d = DMatrix::from_fn(2 * n, n, |_, _| rng.next_f64());
         let f = DVector::from_fn(2 * n, |_, _| rng.next_f64().abs() * 0.5 + 0.1);
 
-        let cfg = QpConfig { solver: QpSolver::Admm, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Admm,
+            ..Default::default()
+        };
         let admm = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
-        assert_eq!(admm.status, QpStatus::Optimal, "adaptive ρ should converge in-budget");
+        assert_eq!(
+            admm.status,
+            QpStatus::Optimal,
+            "adaptive ρ should converge in-budget"
+        );
 
-        let as_cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let as_cfg = QpConfig {
+            solver: QpSolver::ActiveSet,
+            ..Default::default()
+        };
         let act = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &as_cfg);
         assert!(
             (&admm.x - &act.x).norm() < 1e-4,
@@ -2824,12 +3399,23 @@ mod tests {
         let d = DMatrix::from_fn(2 * n, n, |_, _| rng.next_f64());
         let f = DVector::from_fn(2 * n, |_, _| rng.next_f64().abs() * 0.5 + 0.1);
 
-        let cfg = QpConfig { solver: QpSolver::Admm, max_iters: 5, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Admm,
+            max_iters: 5,
+            ..Default::default()
+        };
         let admm = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
         assert_eq!(admm.status, QpStatus::MaxIterations);
-        assert!(admm.x.iter().all(|v| v.is_finite()), "iterate must not blow up: {:?}", admm.x);
+        assert!(
+            admm.x.iter().all(|v| v.is_finite()),
+            "iterate must not blow up: {:?}",
+            admm.x
+        );
 
-        let as_cfg = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let as_cfg = QpConfig {
+            solver: QpSolver::ActiveSet,
+            ..Default::default()
+        };
         let act = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &as_cfg);
         assert!(
             (&admm.x - &act.x).norm() < 5.0,
@@ -2850,7 +3436,9 @@ mod tests {
         let mut c = DVector::zeros(n);
         for (k, &w) in weights.iter().enumerate() {
             let rows = 6 + k * 3;
-            let a = DMatrix::from_fn(rows, n, |i, j| ((i * (7 + k) + j * (3 + k)) as f64 * 0.31).sin());
+            let a = DMatrix::from_fn(rows, n, |i, j| {
+                ((i * (7 + k) + j * (3 + k)) as f64 * 0.31).sin()
+            });
             let b = DVector::from_fn(rows, |i, _| ((i as f64) * 0.8).cos() * 100.0);
             h += w * a.transpose() * &a;
             c -= w * a.transpose() * &b;
@@ -2858,10 +3446,528 @@ mod tests {
         let d = DMatrix::from_fn(44, n, |i, j| ((i * 5 + j * 3) as f64 * 0.23).cos());
         let f = DVector::from_fn(44, |i, _| 0.5 + 0.1 * ((i as f64) * 0.7).sin().abs());
 
-        let cfg = QpConfig { solver: QpSolver::Admm, ..Default::default() };
+        let cfg = QpConfig {
+            solver: QpSolver::Admm,
+            ..Default::default()
+        };
         let sol = solve_qp(&h, &c, None, None, Some(&d), Some(&f), None, &cfg);
-        assert_eq!(sol.status, QpStatus::Optimal, "adaptive ρ should tame the ill-scaled problem");
+        assert_eq!(
+            sol.status,
+            QpStatus::Optimal,
+            "adaptive ρ should tame the ill-scaled problem"
+        );
         assert!(sol.iterations < 500, "took {} iterations", sol.iterations);
     }
+}
 
+// Native libraries are linked only when a corresponding optional feature is on.
+#[cfg(any(
+    feature = "proxqp",
+    feature = "eiquadprog",
+    feature = "qpoases",
+    feature = "osqp",
+    feature = "hpipm"
+))]
+unsafe extern "C" {
+    fn misa_native_qp(
+        backend: i32,
+        n: i32,
+        me: i32,
+        mi: i32,
+        h: *const f64,
+        g: *const f64,
+        ae: *const f64,
+        be: *const f64,
+        ai: *const f64,
+        bi: *const f64,
+        max_iter: i32,
+        ftol: f64,
+        otol: f64,
+        warm: i32,
+        x: *mut f64,
+        y: *mut f64,
+        z: *mut f64,
+        iterations: *mut i32,
+        raw: *mut i32,
+        times: *mut u64,
+        context: *mut usize,
+    ) -> i32;
+    fn misa_native_free(context: usize);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_qp_native(
+    h: &DMatrix<f64>,
+    c: &DVector<f64>,
+    ae: Option<&DMatrix<f64>>,
+    be: Option<&DVector<f64>>,
+    ai: Option<&DMatrix<f64>>,
+    bi: Option<&DVector<f64>>,
+    config: &QpConfig,
+    mut workspace: Option<&mut QpWorkspace>,
+) -> QpSolution {
+    let enabled = match config.solver {
+        QpSolver::Proxqp => cfg!(feature = "proxqp"),
+        QpSolver::Eiquadprog => cfg!(feature = "eiquadprog"),
+        QpSolver::Qpoases => cfg!(feature = "qpoases"),
+        QpSolver::Osqp => cfg!(feature = "osqp"),
+        QpSolver::Hpipm => cfg!(feature = "hpipm"),
+        _ => false,
+    };
+    assert!(
+        enabled,
+        "{:?} requires its corresponding misa-wbc Cargo feature and native/setup.sh dependencies",
+        config.solver
+    );
+    #[cfg(any(
+        feature = "proxqp",
+        feature = "eiquadprog",
+        feature = "qpoases",
+        feature = "osqp",
+        feature = "hpipm"
+    ))]
+    {
+        let n = h.nrows();
+        assert_eq!(h.ncols(), n);
+        assert_eq!(c.len(), n);
+        let (ae, be) = unpack_pair(ae, be, n, "ae/be");
+        let (ai, bi) = unpack_pair(ai, bi, n, "ai/bi");
+        let me = ae.nrows();
+        let mi = ai.nrows();
+        if !config.feasibility_tol.is_finite()
+            || config.feasibility_tol <= 0.
+            || !config.optimality_tol.is_finite()
+            || config.optimality_tol <= 0.
+            || config.max_iters == 0
+            || !h
+                .iter()
+                .chain(c.iter())
+                .chain(ae.iter())
+                .chain(be.iter())
+                .chain(ai.iter())
+                .chain(bi.iter())
+                .all(|v| v.is_finite())
+        {
+            let mut sol = fail(n, me, mi, QpStatus::NumericalFailure);
+            sol.diagnostics = Some(QpDiagnostics {
+                raw_status: "InvalidInput".into(),
+                ..Default::default()
+            });
+            if let Some(ws) = workspace {
+                ws.clear();
+            }
+            return sol;
+        }
+
+        // A hierarchy can exhaust its nullspace. With zero variables the
+        // problem is entirely decided by its constant constraint right sides;
+        // no native solver (or persisted state) should be entered.
+        if n == 0 {
+            let feasible = be.iter().all(|b| b.abs() <= config.feasibility_tol)
+                && bi.iter().all(|b| *b >= -config.feasibility_tol);
+            if let Some(ws) = workspace {
+                ws.clear();
+            }
+            let mut sol = fail(
+                0,
+                me,
+                mi,
+                if feasible {
+                    QpStatus::Optimal
+                } else {
+                    QpStatus::Infeasible
+                },
+            );
+            if feasible {
+                sol.objective = 0.;
+            }
+            sol.diagnostics = Some(QpDiagnostics {
+                raw_status: if feasible {
+                    "EmptyProblemFeasible"
+                } else {
+                    "EmptyProblemInfeasible"
+                }
+                .into(),
+                ..Default::default()
+            });
+            return sol;
+        }
+
+        let backend = match config.solver {
+            QpSolver::Proxqp => 0,
+            QpSolver::Eiquadprog => 1,
+            QpSolver::Qpoases => 2,
+            QpSolver::Osqp => 3,
+            QpSolver::Hpipm => 4,
+            _ => unreachable!(),
+        };
+        let mut x = DVector::zeros(n);
+        let mut y = DVector::zeros(me);
+        let mut z = DVector::zeros(mi);
+        let mut warm = false;
+        if backend == 0 || backend == 2 || backend == 3 {
+            if let Some(ws) = workspace.as_deref() {
+                if let (Some(px), Some(py), Some(pz)) = (&ws.x, &ws.ipm_y, &ws.ipm_z) {
+                    if px.len() == n && py.len() == me && pz.len() == mi {
+                        x.copy_from(px);
+                        y.copy_from(py);
+                        z.copy_from(pz);
+                        warm = true;
+                    }
+                }
+            }
+        }
+        let context = workspace.as_deref_mut().map_or(std::ptr::null_mut(), |ws| {
+            &mut ws.native.handle as *mut usize
+        });
+        let mut iterations = 0;
+        let mut raw = 0;
+        let mut times = [0u64; 5];
+        let code = unsafe {
+            misa_native_qp(
+                backend,
+                n.try_into().unwrap(),
+                me.try_into().unwrap(),
+                mi.try_into().unwrap(),
+                h.as_ptr(),
+                c.as_ptr(),
+                ae.as_ptr(),
+                be.as_ptr(),
+                ai.as_ptr(),
+                bi.as_ptr(),
+                config.max_iters.try_into().unwrap(),
+                config.feasibility_tol,
+                config.optimality_tol,
+                i32::from(warm),
+                x.as_mut_ptr(),
+                y.as_mut_ptr(),
+                z.as_mut_ptr(),
+                &mut iterations,
+                &mut raw,
+                times.as_mut_ptr(),
+                context,
+            )
+        };
+        let status = match code {
+            0 => QpStatus::Optimal,
+            1 => QpStatus::MaxIterations,
+            2 => QpStatus::Infeasible,
+            _ => QpStatus::NumericalFailure,
+        };
+        if let Some(ws) = workspace {
+            if status == QpStatus::Optimal && x.iter().all(|v| v.is_finite()) {
+                ws.x = Some(x.clone());
+                ws.ipm_y = Some(y.clone());
+                ws.ipm_z = Some(z.clone());
+            } else {
+                ws.clear();
+            }
+        }
+        let objective = 0.5 * x.dot(&(h * &x)) + c.dot(&x);
+        QpSolution {
+            x,
+            objective,
+            lambda_eq: y,
+            lambda_iq: z,
+            status,
+            iterations: iterations.max(0) as usize,
+            diagnostics: Some(QpDiagnostics {
+                raw_status: format!("{:?}:{}", config.solver, raw),
+                conversion_ns: times[0],
+                setup_ns: times[1],
+                update_ns: times[2],
+                solve_ns: times[3],
+                warm_start_used: times[4] != 0,
+            }),
+        }
+    }
+    #[cfg(not(any(
+        feature = "proxqp",
+        feature = "eiquadprog",
+        feature = "qpoases",
+        feature = "osqp",
+        feature = "hpipm"
+    )))]
+    {
+        let _ = (h, c, ae, be, ai, bi, workspace);
+        unreachable!()
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "proxqp",
+        feature = "eiquadprog",
+        feature = "qpoases",
+        feature = "osqp",
+        feature = "hpipm"
+    )
+))]
+mod native_tests {
+    use super::*;
+    fn solvers() -> Vec<QpSolver> {
+        let mut v = Vec::new();
+        #[cfg(feature = "proxqp")]
+        v.push(QpSolver::Proxqp);
+        #[cfg(feature = "eiquadprog")]
+        v.push(QpSolver::Eiquadprog);
+        #[cfg(feature = "qpoases")]
+        v.push(QpSolver::Qpoases);
+        #[cfg(feature = "osqp")]
+        v.push(QpSolver::Osqp);
+        #[cfg(feature = "hpipm")]
+        v.push(QpSolver::Hpipm);
+        v
+    }
+    #[test]
+    fn native_iteration_cap_and_dependent_equalities_never_claim_bad_optimum() {
+        let h = DMatrix::identity(3, 3);
+        let g = DVector::from_vec(vec![-2., -1., -3.]);
+        let ai = DMatrix::from_row_slice(4, 3, &[1., 0., 0., -1., 0., 0., 0., 1., 0., 0., 0., 1.]);
+        let bi = DVector::from_vec(vec![0., 0., 1., 0.5]);
+        let ae = DMatrix::from_row_slice(2, 3, &[1., 1., 0., 2., 2., 0.]);
+        let be = DVector::from_vec(vec![1., 2.]);
+        for solver in solvers() {
+            for limited in [true, false] {
+                let config = QpConfig {
+                    solver,
+                    max_iters: if limited { 1 } else { 500 },
+                    feasibility_tol: 1e-8,
+                    optimality_tol: 1e-8,
+                    ..Default::default()
+                };
+                let eq = if limited { None } else { Some((&ae, &be)) };
+                let sol = solve_qp(
+                    &h,
+                    &g,
+                    eq.map(|p| p.0),
+                    eq.map(|p| p.1),
+                    Some(&ai),
+                    Some(&bi),
+                    None,
+                    &config,
+                );
+                if sol.status == QpStatus::Optimal {
+                    let residual = crate::qp_check::check(&h, &g, eq, Some((&ai, &bi)), &sol);
+                    assert!(
+                        residual.accepted(1e-6),
+                        "{solver:?} limited={limited}: {sol:?} {residual:?}"
+                    );
+                } else {
+                    assert!(matches!(
+                        sol.status,
+                        QpStatus::MaxIterations | QpStatus::Infeasible | QpStatus::NumericalFailure
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_zero_variable_constraints_and_workspace_reset() {
+        let h = DMatrix::zeros(0, 0);
+        let g = DVector::zeros(0);
+        let a = DMatrix::zeros(1, 0);
+        for solver in solvers() {
+            let config = QpConfig {
+                solver,
+                ..Default::default()
+            };
+            let mut ws = QpWorkspace::new();
+            ws.x = Some(DVector::from_element(2, 1.));
+            let empty = solve_qp_warm(&h, &g, None, None, None, None, None, &config, &mut ws);
+            assert_eq!(empty.status, QpStatus::Optimal, "{solver:?}");
+            assert_eq!(empty.objective, 0.);
+            assert!(ws.x.is_none());
+            assert_eq!(
+                empty.diagnostics.unwrap().raw_status,
+                "EmptyProblemFeasible"
+            );
+            for (be, bi, status) in [
+                (0., 1., QpStatus::Optimal),
+                (1., 1., QpStatus::Infeasible),
+                (0., -1., QpStatus::Infeasible),
+            ] {
+                let be = DVector::from_element(1, be);
+                let bi = DVector::from_element(1, bi);
+                let sol = solve_qp(
+                    &h,
+                    &g,
+                    Some(&a),
+                    Some(&be),
+                    Some(&a),
+                    Some(&bi),
+                    None,
+                    &config,
+                );
+                assert_eq!(sol.status, status, "{solver:?}");
+                assert_eq!(sol.iterations, 0);
+                assert_eq!(sol.lambda_eq.len(), 1);
+                assert_eq!(sol.lambda_iq.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn native_known_primal_and_dual_solution() {
+        let h = DMatrix::identity(2, 2);
+        let g = DVector::from_vec(vec![-2., -1.]);
+        let ae = DMatrix::from_row_slice(1, 2, &[1., 1.]);
+        let be = DVector::from_element(1, 1.);
+        let ai = DMatrix::from_row_slice(1, 2, &[1., 0.]);
+        let bi = DVector::from_element(1, 0.3);
+        for solver in solvers() {
+            let cfg = QpConfig {
+                solver,
+                feasibility_tol: 1e-8,
+                optimality_tol: 1e-8,
+                max_iters: 10000,
+                ..Default::default()
+            };
+            let sol = solve_qp(
+                &h,
+                &g,
+                Some(&ae),
+                Some(&be),
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+            );
+            assert_eq!(sol.status, QpStatus::Optimal, "{solver:?}: {sol:?}");
+            assert!(
+                (&sol.x - DVector::from_vec(vec![0.3, 0.7])).norm() < 1e-6,
+                "{solver:?}: {sol:?}"
+            );
+            assert!((sol.lambda_eq[0] - 0.3).abs() < 1e-6, "{solver:?}: {sol:?}");
+            assert!((sol.lambda_iq[0] - 1.4).abs() < 1e-6, "{solver:?}: {sol:?}");
+        }
+    }
+    #[test]
+    fn native_matrix_updates_match_cold_and_reject_nan() {
+        for solver in solvers() {
+            let cfg = QpConfig {
+                solver,
+                feasibility_tol: 1e-8,
+                optimality_tol: 1e-8,
+                max_iters: 10000,
+                ..Default::default()
+            };
+            let mut ws = QpWorkspace::new();
+            for k in 0..5 {
+                let n = if k < 3 { 2 } else { 3 };
+                let h = DMatrix::identity(n, n) * (1. + k as f64 * 0.1);
+                let g = DVector::from_element(n, -2. + k as f64 * 0.07);
+                let ai = DMatrix::identity(n, n) * (1. + k as f64 * 0.02);
+                let bi = DVector::from_element(n, 0.5 + k as f64 * 0.03);
+                let cold = solve_qp(&h, &g, None, None, Some(&ai), Some(&bi), None, &cfg);
+                let warm = solve_qp_warm(
+                    &h,
+                    &g,
+                    None,
+                    None,
+                    Some(&ai),
+                    Some(&bi),
+                    None,
+                    &cfg,
+                    &mut ws,
+                );
+                assert_eq!(warm.status, QpStatus::Optimal, "{solver:?} {warm:?}");
+                assert!(
+                    (&cold.x - &warm.x).norm() < 1e-6,
+                    "{solver:?} {cold:?} {warm:?}"
+                );
+            }
+            let bad = DMatrix::from_element(1, 1, f64::NAN);
+            let g = DVector::zeros(1);
+            assert_eq!(
+                solve_qp_warm(&bad, &g, None, None, None, None, None, &cfg, &mut ws).status,
+                QpStatus::NumericalFailure
+            );
+        }
+    }
+    #[test]
+    fn native_infeasible_not_optimal() {
+        let h = DMatrix::identity(1, 1);
+        let g = DVector::zeros(1);
+        let ai = DMatrix::from_row_slice(2, 1, &[1., -1.]);
+        let bi = DVector::from_vec(vec![0., -1.]);
+        for solver in solvers() {
+            let cfg = QpConfig {
+                solver,
+                max_iters: 100,
+                ..Default::default()
+            };
+            let sol = solve_qp(&h, &g, None, None, Some(&ai), Some(&bi), None, &cfg);
+            assert_ne!(sol.status, QpStatus::Optimal, "{solver:?}: {sol:?}");
+        }
+    }
+    #[test]
+    fn native_seeded_replay_and_dimension_reset() {
+        let h = DMatrix::identity(2, 2);
+        let g = DVector::from_vec(vec![-2., -1.]);
+        let ai = DMatrix::identity(2, 2);
+        let bi = DVector::from_element(2, 0.5);
+        for solver in solvers() {
+            let cfg = QpConfig {
+                solver,
+                feasibility_tol: 1e-8,
+                optimality_tol: 1e-8,
+                max_iters: 10000,
+                ..Default::default()
+            };
+            let mut ws = QpWorkspace::new();
+            let cold = solve_qp_warm(
+                &h,
+                &g,
+                None,
+                None,
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+                &mut ws,
+            );
+            let warm = solve_qp_warm(
+                &h,
+                &g,
+                None,
+                None,
+                Some(&ai),
+                Some(&bi),
+                None,
+                &cfg,
+                &mut ws,
+            );
+            assert_eq!(cold.status, QpStatus::Optimal);
+            assert_eq!(warm.status, QpStatus::Optimal);
+            assert!((&cold.x - &warm.x).norm() < 1e-6);
+            let used = warm.diagnostics.unwrap().warm_start_used;
+            assert_eq!(
+                used,
+                matches!(
+                    solver,
+                    QpSolver::Proxqp | QpSolver::Qpoases | QpSolver::Osqp
+                )
+            );
+            ws.clear();
+            assert!(
+                !solve_qp_warm(
+                    &h,
+                    &g,
+                    None,
+                    None,
+                    Some(&ai),
+                    Some(&bi),
+                    None,
+                    &cfg,
+                    &mut ws
+                )
+                .diagnostics
+                .unwrap()
+                .warm_start_used
+            );
+        }
+    }
 }

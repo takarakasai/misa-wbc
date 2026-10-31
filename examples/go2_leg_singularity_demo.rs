@@ -32,7 +32,7 @@ use misarta::fk::forward_kinematics;
 use misarta::jacobian::{compute_jacobian_dot_times_v, compute_joint_jacobian};
 use misarta::se3;
 
-use misa_wbc::{refgen, tasks, Dynamics, Formulation, QpSolver, SolveConfig, Solver};
+use misa_wbc::{Dynamics, Formulation, QpSolver, SolveConfig, Solver, refgen, tasks};
 use nalgebra::{DMatrix, DVector, Vector3};
 
 const DT: f64 = 0.004; // 250 Hz
@@ -65,7 +65,10 @@ fn main() {
     let formulation = parse_formulation(args.get(1).map(|s| s.as_str()).unwrap_or("explicit"));
     let backend = parse_backend(args.get(2).map(|s| s.as_str()).unwrap_or("activeset"));
     let damped = args.get(3).map(|s| s.as_str()) == Some("damped");
-    eprintln!("formulation={:?} backend={:?} damped={damped}", formulation, backend);
+    eprintln!(
+        "formulation={:?} backend={:?} damped={damped}",
+        formulation, backend
+    );
 
     let path = format!(
         "{}/../articara/models/unitree_go2/go2.misa",
@@ -87,8 +90,12 @@ fn main() {
     // re-deriving any of this from the .misa TOML itself.
     {
         let mesh_dir = std::path::Path::new(&path).parent().unwrap().to_path_buf();
-        let manifest_path = format!("{}/examples/models/go2_mesh_manifest.csv", env!("CARGO_MANIFEST_DIR"));
-        let mut manifest = String::from("parent_joint,mesh_path,tx,ty,tz,r00,r01,r02,r10,r11,r12,r20,r21,r22\n");
+        let manifest_path = format!(
+            "{}/examples/models/go2_mesh_manifest.csv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut manifest =
+            String::from("parent_joint,mesh_path,tx,ty,tz,r00,r01,r02,r10,r11,r12,r20,r21,r22\n");
         for obj in &vis.objects {
             if let Some(mesh_path) = &obj.mesh_path {
                 let resolved = mesh_dir.join(mesh_path);
@@ -98,7 +105,9 @@ fn main() {
                     "{},{},{:.6},{:.6},{:.6}",
                     obj.parent_joint,
                     resolved.display(),
-                    t.x, t.y, t.z
+                    t.x,
+                    t.y,
+                    t.z
                 ));
                 for row in 0..3 {
                     for col in 0..3 {
@@ -192,11 +201,17 @@ fn main() {
     let ee0 = se3::translation(&data0.oMi[ee_idx]);
     let dir = (ee0 - hip_origin).normalize();
 
-    let cfg = SolveConfig { backend, ..SolveConfig::default() };
+    let cfg = SolveConfig {
+        backend,
+        ..SolveConfig::default()
+    };
     let mut solver = Solver::new();
 
     {
-        let topo_path = format!("{}/examples/models/go2_topology.csv", env!("CARGO_MANIFEST_DIR"));
+        let topo_path = format!(
+            "{}/examples/models/go2_topology.csv",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let mut topo = String::from("idx,name,parent\n");
         for (i, j) in model.joints.iter().enumerate().skip(1) {
             topo.push_str(&format!("{i},{},{}\n", j.name, j.parent));
@@ -227,7 +242,11 @@ fn main() {
         let dj_v = DVector::from_column_slice(dj_v6.rows(3, 3).into_owned().as_slice());
 
         let svd = nalgebra::linalg::SVD::new(j_foot.clone(), false, false);
-        let sigma_min = svd.singular_values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let sigma_min = svd
+            .singular_values
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
 
         let data = forward_kinematics(&model, &q);
         let ee_pos = se3::translation(&data.oMi[ee_idx]);
@@ -284,8 +303,13 @@ fn main() {
             q[i] += v[i] * DT;
         }
 
-        if q.iter().chain(v.iter()).any(|x| !x.is_finite() || x.abs() > 1e3) {
-            eprintln!("STATE DIVERGED at tick {tick} (t={t:.4}s) -- stopping early, trace truncated here");
+        if q.iter()
+            .chain(v.iter())
+            .any(|x| !x.is_finite() || x.abs() > 1e3)
+        {
+            eprintln!(
+                "STATE DIVERGED at tick {tick} (t={t:.4}s) -- stopping early, trace truncated here"
+            );
             break;
         }
 
@@ -305,7 +329,9 @@ fn main() {
                 }
             }
         }
-        print!(",{sigma_min:.6},{tau_norm:.5},{tau_max_abs:.5},{qddot_norm:.5},{status_code},{degraded_level}");
+        print!(
+            ",{sigma_min:.6},{tau_norm:.5},{tau_max_abs:.5},{qddot_norm:.5},{status_code},{degraded_level}"
+        );
         println!();
     }
 }

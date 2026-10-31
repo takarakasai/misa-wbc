@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use misa_wbc::qp::QpSolver;
 use misa_wbc::{
-    tasks, Dynamics, Extracted, Formulation, HqpStrategy, SolveConfig, SolveStatus, Solver, Task,
+    Dynamics, Extracted, Formulation, HqpStrategy, SolveConfig, SolveStatus, Solver, Task, tasks,
 };
 use nalgebra::{DMatrix, DVector};
 
@@ -127,8 +127,9 @@ fn stack(d: &Dynamics, jc: &DMatrix<f64>, dj_v: &DVector<f64>) -> Vec<Task> {
     for c in 0..NC {
         f_nom[3 * c + 2] = TOTAL_MASS * 9.81 / NC as f64;
     }
-    let p1 = tasks::cartesian_acceleration(d.qddot(), &j_base, &DVector::zeros(3), &DVector::zeros(3))
-        + tasks::regularize(&f, &f_nom).weight(0.1);
+    let p1 =
+        tasks::cartesian_acceleration(d.qddot(), &j_base, &DVector::zeros(3), &DVector::zeros(3))
+            + tasks::regularize(&f, &f_nom).weight(0.1);
 
     let p2 = tasks::track(d.qddot(), &DVector::zeros(NV))
         + tasks::track(d.tau(), &DVector::zeros(NA)).weight(0.1);
@@ -164,13 +165,22 @@ fn gauges(
         }
     }
     let tau_peak = e.tau.amax();
-    Gauges { eom, contact, worst_friction_margin: worst, tau_peak }
+    Gauges {
+        eom,
+        contact,
+        worst_friction_margin: worst,
+        tau_peak,
+    }
 }
 
 fn main() {
     let (mass, h, jc, dj_v) = go2_like_system();
 
-    let formulations = [Formulation::Explicit, Formulation::AccelSpace, Formulation::ForceSpace];
+    let formulations = [
+        Formulation::Explicit,
+        Formulation::AccelSpace,
+        Formulation::ForceSpace,
+    ];
     let strategies = [
         (HqpStrategy::NullSpace, "NullSpace"),
         (HqpStrategy::ForceBudgetCascade, "ForceBudget"),
@@ -208,7 +218,11 @@ fn main() {
         let levels = stack(&d, &jc, &dj_v);
         for (strategy, sname) in strategies {
             for (backend, bname) in backends {
-                let cfg = SolveConfig { strategy, backend, ..Default::default() };
+                let cfg = SolveConfig {
+                    strategy,
+                    backend,
+                    ..Default::default()
+                };
 
                 // One persistent session per combination — the realistic
                 // controller shape, and what lets the active-set backend

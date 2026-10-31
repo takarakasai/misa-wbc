@@ -19,7 +19,7 @@
 use nalgebra::DVector;
 
 use crate::ho_qp::{HoQp, WarmStart};
-use crate::qp::{QpConfig, QpSolver, QpStatus, QpWorkspace};
+use crate::qp::{QpConfig, QpDiagnostics, QpSolver, QpStatus, QpWorkspace};
 use crate::task::Task;
 
 /// Which hierarchical-QP strategy resolves the priority stack.
@@ -39,8 +39,16 @@ pub enum HqpStrategy {
     /// task if the constraints leave it room (this is GID's documented
     /// behaviour, useful for equivalence studies against it).
     ForceBudgetCascade,
-    // Future: WeightedQp (single QP, priorities as weights — fast,
-    // approximate), EHqp (equality-only pseudo-inverse), ...
+    /// One QP, priorities as WEIGHTS (the IHMC / whole-body-QP structure).
+    /// Level 0's equalities (dynamics, contacts) stay hard equality
+    /// constraints and every level's inequalities stay hard; the
+    /// equalities of level `k >= 1` enter the cost with weight
+    /// `level_ratio^-(k-1)`. Lower levels can then trade against higher
+    /// ones instead of living in their null space -- the property the
+    /// strict cascade lacks when an angular-momentum task and a posture
+    /// task compete for the same joints (measured on G1, 2026-09-20/24).
+    WeightedQp { level_ratio: u32 },
+    // Future: EHqp (equality-only pseudo-inverse), ...
 }
 
 /// Configuration for [`solve`]: the strategy, the inner-QP backend, and
@@ -61,6 +69,11 @@ pub struct SolveConfig {
     /// tick's optimum toward the previous solution to damp jitter; `0`
     /// (default) is a cold solve.
     pub prox_weight: f64,
+    /// Optional independent inner-QP validation; None preserves existing behavior.
+    /// Requires zero prox_weight and a positive finite tolerance.
+    pub validation_tol: Option<f64>,
+    /// Solve the first inequality-bearing HQP level without relaxation.
+    pub hard_first_inequalities: bool,
 }
 
 impl Default for SolveConfig {
@@ -76,6 +89,8 @@ impl Default for SolveConfig {
             feasibility_tol: qp.feasibility_tol,
             optimality_tol: qp.optimality_tol,
             prox_weight: 0.0,
+            validation_tol: None,
+            hard_first_inequalities: false,
         }
     }
 }
@@ -88,6 +103,8 @@ impl SolveConfig {
             max_iters: self.max_iters,
             feasibility_tol: self.feasibility_tol,
             optimality_tol: self.optimality_tol,
+            absolute_gap: self.validation_tol.is_some(),
+            hard_first_inequalities: self.hard_first_inequalities,
             // prox is applied per-level via the warm-start projection.
             prox_weight: 0.0,
         }
@@ -117,6 +134,10 @@ pub struct Solution {
     /// [`solve_warm`]. (Same values as [`Solution::x`]; named to make
     /// the round-trip intent explicit at call sites.)
     pub warm_anchor: DVector<f64>,
+    /// Outcome of every layer, including failures after the first degradation.
+    pub level_statuses: Vec<QpStatus>,
+    /// Raw backend statuses/timings, aligned with level_statuses.
+    pub level_diagnostics: Vec<Option<QpDiagnostics>>,
 }
 
 /// Errors that prevent a solve from running at all (as opposed to a
@@ -125,15 +146,28 @@ pub struct Solution {
 pub enum WbcError {
     /// The level list was empty — nothing to solve.
     NoLevels,
+    InvalidValidationConfig,
     /// Two levels disagree on the decision-vector size.
-    DimMismatch { level: usize, expected: usize, found: usize },
+    DimMismatch {
+        level: usize,
+        expected: usize,
+        found: usize,
+    },
 }
 
 impl std::fmt::Display for WbcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            WbcError::InvalidValidationConfig => write!(
+                f,
+                "checked solve requires positive finite validation_tol and zero prox_weight"
+            ),
             WbcError::NoLevels => write!(f, "solve: no priority levels given"),
-            WbcError::DimMismatch { level, expected, found } => write!(
+            WbcError::DimMismatch {
+                level,
+                expected,
+                found,
+            } => write!(
                 f,
                 "solve: level {level} has n_decision {found}, expected {expected}"
             ),
@@ -171,7 +205,11 @@ pub fn solve_warm(
     for (i, t) in levels.iter().enumerate() {
         let d = t.n_decision();
         if d != 0 && d != n {
-            return Err(WbcError::DimMismatch { level: i, expected: n, found: d });
+            return Err(WbcError::DimMismatch {
+                level: i,
+                expected: n,
+                found: d,
+            });
         }
     }
 
@@ -185,9 +223,18 @@ fn solve_dispatch(
     n: usize,
     workspaces: Option<&mut [QpWorkspace]>,
 ) -> Result<Solution, WbcError> {
+    if cfg
+        .validation_tol
+        .is_some_and(|tol| !tol.is_finite() || tol <= 0. || cfg.prox_weight != 0.)
+    {
+        return Err(WbcError::InvalidValidationConfig);
+    }
     match cfg.strategy {
         HqpStrategy::NullSpace => Ok(solve_null_space(levels, cfg, warm_anchor, workspaces)),
         HqpStrategy::ForceBudgetCascade => Ok(solve_force_budget(levels, cfg, n, workspaces)),
+        HqpStrategy::WeightedQp { level_ratio } => {
+            Ok(solve_weighted(levels, cfg, n, level_ratio, workspaces))
+        }
     }
 }
 
@@ -253,12 +300,21 @@ impl Solver {
         for (i, t) in levels.iter().enumerate() {
             let d = t.n_decision();
             if d != 0 && d != n {
-                return Err(WbcError::DimMismatch { level: i, expected: n, found: d });
+                return Err(WbcError::DimMismatch {
+                    level: i,
+                    expected: n,
+                    found: d,
+                });
             }
         }
-        self.workspaces.resize_with(levels.len(), QpWorkspace::default);
+        self.workspaces
+            .resize_with(levels.len(), QpWorkspace::default);
 
-        let anchor = if cfg.prox_weight > 0.0 { self.anchor.clone() } else { None };
+        let anchor = if cfg.prox_weight > 0.0 {
+            self.anchor.clone()
+        } else {
+            None
+        };
         let sol = solve_dispatch(
             levels,
             cfg,
@@ -280,13 +336,28 @@ fn solve_null_space(
     mut workspaces: Option<&mut [QpWorkspace]>,
 ) -> Solution {
     let qp_cfg = cfg.qp_cfg();
-    let warm = WarmStart { x_prev: warm_anchor, prox_weight: cfg.prox_weight };
+    let warm = WarmStart {
+        x_prev: warm_anchor,
+        prox_weight: cfg.prox_weight,
+    };
 
     let mut prev: Option<HoQp> = None;
     let mut degraded: Option<(usize, QpStatus)> = None;
+    let mut level_statuses = Vec::with_capacity(levels.len());
+    let mut level_diagnostics = Vec::with_capacity(levels.len());
     for (i, t) in levels.iter().enumerate() {
         let ws_i = workspaces.as_deref_mut().map(|w| &mut w[i]);
-        let hqp = HoQp::new_with_cfg_ws(t.clone(), prev.as_ref(), &warm, &qp_cfg, ws_i);
+        let hqp = HoQp::new_with_cfg_ws_checked(
+            t.clone(),
+            prev.as_ref(),
+            &warm,
+            &qp_cfg,
+            ws_i,
+            false,
+            cfg.validation_tol,
+        );
+        level_statuses.push(hqp.status());
+        level_diagnostics.push(hqp.diagnostics().cloned());
         if degraded.is_none() && hqp.status() != QpStatus::Optimal {
             degraded = Some((i, hqp.status()));
         }
@@ -299,7 +370,13 @@ fn solve_null_space(
         None => SolveStatus::Optimal,
         Some((level, status)) => SolveStatus::Degraded { level, status },
     };
-    Solution { warm_anchor: x.clone(), x, status }
+    Solution {
+        warm_anchor: x.clone(),
+        x,
+        status,
+        level_statuses,
+        level_diagnostics,
+    }
 }
 
 /// The GID-style force-budget cascade (see [`HqpStrategy::ForceBudgetCascade`]).
@@ -334,6 +411,8 @@ fn solve_force_budget(
     let mut stacked_d: Option<DMatrix<f64>> = None;
     let mut stacked_f: Option<DVector<f64>> = None;
     let mut degraded: Option<(usize, QpStatus)> = None;
+    let mut level_statuses = Vec::with_capacity(levels.len());
+    let mut level_diagnostics = Vec::with_capacity(levels.len());
 
     for (k, t) in levels.iter().enumerate() {
         // Accumulate this level's inequalities (they bind from here on).
@@ -361,8 +440,8 @@ fn solve_force_budget(
             .as_ref()
             .map(|f| f - stacked_d.as_ref().expect("d/f stacked together") * &x_c);
 
-        let ws_k = workspaces.as_deref_mut().map(|w| &mut w[k]);
-        let sol = match ws_k {
+        let mut ws_k = workspaces.as_deref_mut().map(|w| &mut w[k]);
+        let mut sol = match ws_k.as_deref_mut() {
             Some(ws) => crate::qp::solve_qp_warm(
                 &h,
                 &g,
@@ -385,6 +464,21 @@ fn solve_force_budget(
                 &qp_cfg,
             ),
         };
+        if let Some(tol) = cfg.validation_tol {
+            let iq = stacked_d.as_ref().zip(shifted_f.as_ref());
+            if !sol.formally_solved()
+                || !crate::qp_check::check(&h, &g, None, iq, &sol).accepted(tol)
+            {
+                if sol.status == QpStatus::Optimal {
+                    sol.status = QpStatus::NumericalFailure;
+                }
+                if let Some(ws) = ws_k {
+                    ws.clear();
+                }
+            }
+        }
+        level_statuses.push(sol.status);
+        level_diagnostics.push(sol.diagnostics.clone());
         if sol.status == QpStatus::Optimal {
             x_c += &sol.x;
         } else if degraded.is_none() {
@@ -397,10 +491,95 @@ fn solve_force_budget(
         None => SolveStatus::Optimal,
         Some((level, status)) => SolveStatus::Degraded { level, status },
     };
-    Solution { warm_anchor: x_c.clone(), x: x_c, status }
+    Solution {
+        warm_anchor: x_c.clone(),
+        x: x_c,
+        status,
+        level_statuses,
+        level_diagnostics,
+    }
 }
 
-fn stack_rows(top: &nalgebra::DMatrix<f64>, bottom: &nalgebra::DMatrix<f64>) -> nalgebra::DMatrix<f64> {
+fn solve_weighted(
+    levels: &[Task],
+    cfg: &SolveConfig,
+    n: usize,
+    level_ratio: u32,
+    workspaces: Option<&mut [QpWorkspace]>,
+) -> Solution {
+    use nalgebra::DMatrix;
+
+    let qp_cfg = cfg.qp_cfg();
+    let ratio = f64::from(level_ratio.max(1));
+    let mut h = DMatrix::<f64>::identity(n, n) * cfg.prox_weight.max(1e-8);
+    let mut g = DVector::<f64>::zeros(n);
+    let mut a_eq: Option<DMatrix<f64>> = None;
+    let mut b_eq: Option<DVector<f64>> = None;
+    let mut d_iq: Option<DMatrix<f64>> = None;
+    let mut f_iq: Option<DVector<f64>> = None;
+    for (k, t) in levels.iter().enumerate() {
+        if t.n_iq() > 0 {
+            d_iq = Some(match d_iq.take() {
+                None => t.d.clone(),
+                Some(d) => stack_rows(&d, &t.d),
+            });
+            f_iq = Some(match f_iq.take() {
+                None => t.f.clone(),
+                Some(f) => stack_vec(&f, &t.f),
+            });
+        }
+        if t.n_eq() == 0 {
+            continue;
+        }
+        if k == 0 {
+            a_eq = Some(t.a.clone());
+            b_eq = Some(t.b.clone());
+        } else {
+            let w = ratio.powi(-(k as i32 - 1));
+            h += t.a.transpose() * &t.a * w;
+            g -= t.a.transpose() * &t.b * w;
+        }
+    }
+    let sol = match workspaces.and_then(|w| w.first_mut()) {
+        Some(ws) => crate::qp::solve_qp_warm(
+            &h,
+            &g,
+            a_eq.as_ref(),
+            b_eq.as_ref(),
+            d_iq.as_ref(),
+            f_iq.as_ref(),
+            None,
+            &qp_cfg,
+            ws,
+        ),
+        None => crate::qp::solve_qp(
+            &h,
+            &g,
+            a_eq.as_ref(),
+            b_eq.as_ref(),
+            d_iq.as_ref(),
+            f_iq.as_ref(),
+            None,
+            &qp_cfg,
+        ),
+    };
+    let status = if sol.status == QpStatus::Optimal {
+        SolveStatus::Optimal
+    } else {
+        SolveStatus::Degraded { level: 0, status: sol.status }
+    };
+    let x = if sol.status == QpStatus::Optimal { sol.x.clone() } else { DVector::zeros(n) };
+    let mut level_statuses = vec![sol.status];
+    level_statuses.resize(levels.len(), sol.status);
+    let mut level_diagnostics = vec![sol.diagnostics.clone()];
+    level_diagnostics.resize(levels.len(), None);
+    Solution { warm_anchor: x.clone(), x, status, level_statuses, level_diagnostics }
+}
+
+fn stack_rows(
+    top: &nalgebra::DMatrix<f64>,
+    bottom: &nalgebra::DMatrix<f64>,
+) -> nalgebra::DMatrix<f64> {
     let mut out = nalgebra::DMatrix::zeros(top.nrows() + bottom.nrows(), top.ncols());
     out.rows_mut(0, top.nrows()).copy_from(top);
     out.rows_mut(top.nrows(), bottom.nrows()).copy_from(bottom);
@@ -419,6 +598,25 @@ mod tests {
     use super::*;
     use nalgebra::DMatrix;
 
+    /// x = [a; b]. level0: a + b = 2 (hard). level1: a = 2. level2: b = 2.
+    /// Strict priority gives a=2, b=0; weights 1 vs 1/r split toward a.
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn weighted_qp_trades_levels_by_weight() {
+        let l0 = Task::equality(DMatrix::from_row_slice(1, 2, &[1.0, 1.0]), DVector::from_vec(vec![2.0]));
+        let l1 = Task::equality(DMatrix::from_row_slice(1, 2, &[1.0, 0.0]), DVector::from_vec(vec![2.0]));
+        let l2 = Task::equality(DMatrix::from_row_slice(1, 2, &[0.0, 1.0]), DVector::from_vec(vec![2.0]));
+        let cfg = SolveConfig { strategy: HqpStrategy::WeightedQp { level_ratio: 1 }, ..SolveConfig::default() };
+        let sol = solve(&[l0.clone(), l1.clone(), l2.clone()], &cfg).unwrap();
+        // equal weights: a = b = 1, and the hard level holds exactly.
+        assert!((sol.x[0] - 1.0).abs() < 1e-5 && (sol.x[1] - 1.0).abs() < 1e-5, "{:?}", sol.x);
+        let cfg = SolveConfig { strategy: HqpStrategy::WeightedQp { level_ratio: 10 }, ..SolveConfig::default() };
+        let sol = solve(&[l0, l1, l2], &cfg).unwrap();
+        // w1 = 1, w2 = 0.1: a = 2 - b, minimise (a-2)^2 + 0.1 (b-2)^2 -> b = 0.2/1.1
+        assert!((sol.x[1] - 0.2 / 1.1).abs() < 1e-5, "{:?}", sol.x);
+        assert!((sol.x[0] + sol.x[1] - 2.0).abs() < 1e-6);
+    }
+
     /// x = [a(1); b(1)];  prio0: a = 1 (eq) + b ≤ 3 (ineq);  prio1: b = 2.
     #[cfg(feature = "clarabel")]
     fn levels() -> Vec<Task> {
@@ -436,9 +634,82 @@ mod tests {
         vec![p0, p1]
     }
 
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn raw_diagnostics_survive_both_hierarchy_strategies() {
+        for strategy in [HqpStrategy::NullSpace, HqpStrategy::ForceBudgetCascade] {
+            let result = solve(
+                &levels(),
+                &SolveConfig {
+                    strategy,
+                    backend: QpSolver::Clarabel,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.level_statuses.len(), 2);
+            assert_eq!(result.level_diagnostics.len(), 2);
+            assert!(
+                result
+                    .level_diagnostics
+                    .iter()
+                    .all(|d| d.as_ref().is_some_and(|d| !d.raw_status.is_empty()))
+            );
+            assert!(
+                result
+                    .level_statuses
+                    .iter()
+                    .all(|s| *s == QpStatus::Optimal)
+            );
+        }
+    }
+
+    #[test]
+    fn checked_solver_validates_configuration_and_accepts_known_solution() {
+        for strategy in [HqpStrategy::NullSpace, HqpStrategy::ForceBudgetCascade] {
+            let cfg = SolveConfig {
+                strategy,
+                validation_tol: Some(1e-6),
+                ..Default::default()
+            };
+            assert_eq!(solve(&levels(), &cfg).unwrap().status, SolveStatus::Optimal);
+            let bad = SolveConfig {
+                prox_weight: 1.,
+                ..cfg
+            };
+            assert_eq!(
+                solve(&levels(), &bad).unwrap_err(),
+                WbcError::InvalidValidationConfig
+            );
+        }
+    }
+
+    #[test]
+    fn checked_solver_rejects_loose_solver_feasibility() {
+        let tasks = vec![
+            Task::equality(DMatrix::identity(1, 1), DVector::from_element(1, 2.))
+                + Task::inequality(DMatrix::identity(1, 1), DVector::from_element(1, 1.)),
+        ];
+        for strategy in [HqpStrategy::NullSpace, HqpStrategy::ForceBudgetCascade] {
+            let cfg = SolveConfig {
+                strategy,
+                backend: QpSolver::ActiveSet,
+                feasibility_tol: 10.,
+                validation_tol: Some(1e-6),
+                ..Default::default()
+            };
+            let result = solve(&tasks, &cfg).unwrap();
+            assert!(matches!(result.status, SolveStatus::Degraded { .. }));
+            assert_eq!(result.x, DVector::zeros(1));
+        }
+    }
+
     #[test]
     fn empty_levels_errors() {
-        assert_eq!(solve(&[], &SolveConfig::default()).unwrap_err(), WbcError::NoLevels);
+        assert_eq!(
+            solve(&[], &SolveConfig::default()).unwrap_err(),
+            WbcError::NoLevels
+        );
     }
 
     #[test]
@@ -449,7 +720,11 @@ mod tests {
         ];
         assert!(matches!(
             solve(&bad, &SolveConfig::default()),
-            Err(WbcError::DimMismatch { level: 1, expected: 2, found: 3 })
+            Err(WbcError::DimMismatch {
+                level: 1,
+                expected: 2,
+                found: 3
+            })
         ));
     }
 
@@ -466,7 +741,10 @@ mod tests {
     #[test]
     fn backend_is_switchable() {
         // Same problem, active-set backend — should reach the same answer.
-        let cfg = SolveConfig { backend: QpSolver::ActiveSet, ..Default::default() };
+        let cfg = SolveConfig {
+            backend: QpSolver::ActiveSet,
+            ..Default::default()
+        };
         let sol = solve(&levels(), &cfg).unwrap();
         assert!((sol.x[0] - 1.0).abs() < 1e-5);
         assert!((sol.x[1] - 2.0).abs() < 1e-5);
@@ -475,7 +753,10 @@ mod tests {
     #[cfg(feature = "clarabel")]
     #[test]
     fn warm_anchor_round_trips() {
-        let cfg = SolveConfig { prox_weight: 1e-3, ..Default::default() };
+        let cfg = SolveConfig {
+            prox_weight: 1e-3,
+            ..Default::default()
+        };
         let s1 = solve(&levels(), &cfg).unwrap();
         let s2 = solve_warm(&levels(), &cfg, Some(&s1.warm_anchor)).unwrap();
         assert!((&s1.x - &s2.x).norm() < 1e-4);
@@ -485,7 +766,10 @@ mod tests {
     fn session_matches_stateless_and_stays_optimal() {
         // ActiveSet backend + session: repeated ticks must stay optimal
         // and agree with the stateless solve (and Clarabel).
-        let cfg = SolveConfig { backend: QpSolver::ActiveSet, ..Default::default() };
+        let cfg = SolveConfig {
+            backend: QpSolver::ActiveSet,
+            ..Default::default()
+        };
         let mut solver = Solver::new();
         let stateless = solve(&levels(), &SolveConfig::default()).unwrap();
         for _tick in 0..5 {
@@ -517,5 +801,4 @@ mod tests {
         let s = solver.solve(&levels(), &cfg).unwrap();
         assert!((s.x[0] - 1.0).abs() < 1e-6 && (s.x[1] - 2.0).abs() < 1e-6);
     }
-
 }

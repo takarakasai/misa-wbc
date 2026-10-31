@@ -13,7 +13,7 @@ use misarta::fk::forward_kinematics;
 use misarta::jacobian::{compute_jacobian_dot_times_v, compute_joint_jacobian};
 use misarta::se3;
 
-use misa_wbc::{refgen, tasks, Dynamics, Formulation, SolveConfig, Solver};
+use misa_wbc::{Dynamics, Formulation, SolveConfig, Solver, refgen, tasks};
 use nalgebra::{DMatrix, DVector, Vector3};
 
 const DT: f64 = 0.004; // 250 Hz
@@ -23,8 +23,10 @@ const PERIOD_S: f64 = 3.0; // one full circle every 3s
 
 fn main() {
     let path = format!("{}/examples/models/panda.urdf", env!("CARGO_MANIFEST_DIR"));
-    let imported = misarta_formats::urdf::import(std::path::Path::new(&path)).expect("import panda.urdf");
-    let (model, _vis, _col) = misarta::native::build_model(&imported.file).expect("build panda model");
+    let imported =
+        misarta_formats::urdf::import(std::path::Path::new(&path)).expect("import panda.urdf");
+    let (model, _vis, _col) =
+        misarta::native::build_model(&imported.file).expect("build panda model");
     let (nv, nq) = (model.nv, model.nq);
     assert_eq!(nq, nv, "fixed-base arm expected");
     let na = nv;
@@ -43,7 +45,10 @@ fn main() {
     let mut v = vec![0.0_f64; nv];
 
     let mut tau_max = DVector::from_element(na, 20.0);
-    for (i, &t) in [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0].iter().enumerate() {
+    for (i, &t) in [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
+        .iter()
+        .enumerate()
+    {
         tau_max[i] = t;
     }
     let kp = DVector::from_element(6, 400.0);
@@ -63,7 +68,10 @@ fn main() {
     // — so the plotting script can draw the actual kinematic tree
     // instead of assuming a serial chain.
     {
-        let topo_path = format!("{}/examples/models/panda_topology.csv", env!("CARGO_MANIFEST_DIR"));
+        let topo_path = format!(
+            "{}/examples/models/panda_topology.csv",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let mut topo = String::from("idx,name,parent\n");
         for (i, j) in model.joints.iter().enumerate().skip(1) {
             topo.push_str(&format!("{i},{},{}\n", j.name, j.parent));
@@ -88,7 +96,11 @@ fn main() {
             centre.y + RADIUS * phase.cos() - RADIUS,
             centre.z + RADIUS * phase.sin(),
         );
-        let v_ref = Vector3::new(0.0, -RADIUS * omega * phase.sin(), RADIUS * omega * phase.cos());
+        let v_ref = Vector3::new(
+            0.0,
+            -RADIUS * omega * phase.sin(),
+            RADIUS * omega * phase.cos(),
+        );
 
         let mass = misarta::crba::crba(&model, &q);
         let h = misarta::rnea::nonlinear_effects(&model, &q, &v);
@@ -137,8 +149,13 @@ fn main() {
         // Numerical-divergence guard -- see panda_singularity_demo.rs
         // for why this matters (a solver can report Optimal every tick
         // while the integrated state quietly runs away).
-        if q.iter().chain(v.iter()).any(|x| !x.is_finite() || x.abs() > 1e3) {
-            eprintln!("STATE DIVERGED at tick {tick} (t={t:.4}s) -- stopping early, trace truncated here");
+        if q.iter()
+            .chain(v.iter())
+            .any(|x| !x.is_finite() || x.abs() > 1e3)
+        {
+            eprintln!(
+                "STATE DIVERGED at tick {tick} (t={t:.4}s) -- stopping early, trace truncated here"
+            );
             break;
         }
 

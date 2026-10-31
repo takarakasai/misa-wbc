@@ -18,8 +18,8 @@
 
 use std::time::Instant;
 
-use misa_wbc::qp::{solve_qp, solve_qp_warm, QpConfig, QpSolver, QpStatus, QpWorkspace};
-use misa_wbc::{tasks, Dynamics, Formulation, Task};
+use misa_wbc::qp::{QpConfig, QpSolver, QpStatus, QpWorkspace, solve_qp, solve_qp_warm};
+use misa_wbc::{Dynamics, Formulation, Task, tasks};
 use nalgebra::{DMatrix, DVector};
 
 const NV: usize = 18;
@@ -122,11 +122,12 @@ fn build_problem() -> TickProblem {
     for c in 0..NC {
         f_nom[3 * c + 2] = TOTAL_MASS * 9.81 / NC as f64;
     }
-    let p1 = tasks::cartesian_acceleration(d.qddot(), &j_base, &DVector::zeros(3), &DVector::zeros(3))
-        + tasks::regularize(&f, &f_nom);
+    let p1 =
+        tasks::cartesian_acceleration(d.qddot(), &j_base, &DVector::zeros(3), &DVector::zeros(3))
+            + tasks::regularize(&f, &f_nom);
     let n = d.layout().n_decision();
-    let p2 = tasks::track(d.qddot(), &DVector::zeros(NV))
-        + tasks::track(d.tau(), &DVector::zeros(NA));
+    let p2 =
+        tasks::track(d.qddot(), &DVector::zeros(NV)) + tasks::track(d.tau(), &DVector::zeros(NA));
 
     let weights = [1.0, 0.1, 1e-3];
     let levels: Vec<Task> = vec![p0, p1, p2];
@@ -152,7 +153,12 @@ fn build_problem() -> TickProblem {
         fvec.rows_mut(r, fv.len()).copy_from(&fv);
         r += m.nrows();
     }
-    TickProblem { h, d: dmat, f: fvec, parts }
+    TickProblem {
+        h,
+        d: dmat,
+        f: fvec,
+        parts,
+    }
 }
 
 /// c(t): the tracking b's drift sinusoidally (base sway + force shift).
@@ -186,14 +192,30 @@ fn main() {
         p.d.nrows()
     );
 
-    let as_cfg = QpConfig { solver: QpSolver::ActiveSet, max_iters: 2000, ..Default::default() };
-    let cl_cfg = QpConfig { solver: QpSolver::Clarabel, ..Default::default() };
+    let as_cfg = QpConfig {
+        solver: QpSolver::ActiveSet,
+        max_iters: 2000,
+        ..Default::default()
+    };
+    let cl_cfg = QpConfig {
+        solver: QpSolver::Clarabel,
+        ..Default::default()
+    };
 
     let mut runs: Vec<Run> = Vec::new();
 
-    let ipm_cfg = QpConfig { solver: QpSolver::Ipm, ..Default::default() };
-    let ipm_mcc_cfg = QpConfig { solver: QpSolver::IpmMcc, ..Default::default() };
-    let admm_cfg = QpConfig { solver: QpSolver::Admm, ..Default::default() };
+    let ipm_cfg = QpConfig {
+        solver: QpSolver::Ipm,
+        ..Default::default()
+    };
+    let ipm_mcc_cfg = QpConfig {
+        solver: QpSolver::IpmMcc,
+        ..Default::default()
+    };
+    let admm_cfg = QpConfig {
+        solver: QpSolver::Admm,
+        ..Default::default()
+    };
 
     for mode in [
         "ActiveSet cold",
@@ -217,20 +239,72 @@ fn main() {
             let sol = match mode {
                 "ActiveSet cold" => {
                     ws.clear();
-                    solve_qp_warm(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &as_cfg, &mut ws)
+                    solve_qp_warm(
+                        &p.h,
+                        &c,
+                        None,
+                        None,
+                        Some(&p.d),
+                        Some(&p.f),
+                        None,
+                        &as_cfg,
+                        &mut ws,
+                    )
                 }
-                "ActiveSet warm" => {
-                    solve_qp_warm(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &as_cfg, &mut ws)
-                }
-                "Ipm" => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &ipm_cfg),
-                "Ipm warm" => {
-                    solve_qp_warm(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &ipm_cfg, &mut ws)
-                }
-                "IpmMcc" => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &ipm_mcc_cfg),
-                "IpmMcc warm" => solve_qp_warm(
-                    &p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &ipm_mcc_cfg, &mut ws,
+                "ActiveSet warm" => solve_qp_warm(
+                    &p.h,
+                    &c,
+                    None,
+                    None,
+                    Some(&p.d),
+                    Some(&p.f),
+                    None,
+                    &as_cfg,
+                    &mut ws,
                 ),
-                "Admm" => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &admm_cfg),
+                "Ipm" => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &ipm_cfg),
+                "Ipm warm" => solve_qp_warm(
+                    &p.h,
+                    &c,
+                    None,
+                    None,
+                    Some(&p.d),
+                    Some(&p.f),
+                    None,
+                    &ipm_cfg,
+                    &mut ws,
+                ),
+                "IpmMcc" => solve_qp(
+                    &p.h,
+                    &c,
+                    None,
+                    None,
+                    Some(&p.d),
+                    Some(&p.f),
+                    None,
+                    &ipm_mcc_cfg,
+                ),
+                "IpmMcc warm" => solve_qp_warm(
+                    &p.h,
+                    &c,
+                    None,
+                    None,
+                    Some(&p.d),
+                    Some(&p.f),
+                    None,
+                    &ipm_mcc_cfg,
+                    &mut ws,
+                ),
+                "Admm" => solve_qp(
+                    &p.h,
+                    &c,
+                    None,
+                    None,
+                    Some(&p.d),
+                    Some(&p.f),
+                    None,
+                    &admm_cfg,
+                ),
                 _ => solve_qp(&p.h, &c, None, None, Some(&p.d), Some(&p.f), None, &cl_cfg),
             };
             times.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -262,7 +336,11 @@ fn main() {
             r.name,
             r.med_ms,
             r.worst_ms,
-            if r.iters > 0 { r.iters.to_string() } else { "—".into() },
+            if r.iters > 0 {
+                r.iters.to_string()
+            } else {
+                "—".into()
+            },
             r.degraded
         );
     }

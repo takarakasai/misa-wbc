@@ -41,9 +41,16 @@ pub fn pd_ff(
 ) -> DVector<f64> {
     let n = x.len();
     assert!(
-        [x_ref.len(), v_ref.len(), v.len(), kp.len(), kd.len(), a_ff.len()]
-            .iter()
-            .all(|&l| l == n),
+        [
+            x_ref.len(),
+            v_ref.len(),
+            v.len(),
+            kp.len(),
+            kd.len(),
+            a_ff.len()
+        ]
+        .iter()
+        .all(|&l| l == n),
         "refgen::pd_ff: dimension mismatch"
     );
     a_ff + kp.component_mul(&(x_ref - x)) + kd.component_mul(&(v_ref - v))
