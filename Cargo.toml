@@ -33,4 +33,4 @@ hpipm = []
 native-all = ["proxqp", "eiquadprog", "qpoases", "osqp", "hpipm"]
 
 [build-dependencies]
-cc = "=1.2.60"
+cc = "1.2"
